@@ -37,7 +37,23 @@ static class Bytes
 /// We intentionally do not reconstruct a clock's settings from guessed defaults.
 public sealed class WireMessage
 {
-    public sealed record Field(int Number, int WireType, byte[] Encoded, ulong? Integer);
+    public sealed record Field(int Number, int WireType, byte[] Encoded, ulong? Integer)
+    {
+        /// Length-delimited contents (wire type 2), without key and length.
+        public byte[]? Payload
+        {
+            get
+            {
+                if (WireType != 2) return null;
+                int i = 0;
+                while (i < Encoded.Length && (Encoded[i] & 0x80) != 0) i++;   // key
+                i++;
+                while (i < Encoded.Length && (Encoded[i] & 0x80) != 0) i++;   // length
+                i++;
+                return i <= Encoded.Length ? Encoded[i..] : null;
+            }
+        }
+    }
     public IReadOnlyList<Field> Fields { get; }
 
     public WireMessage(byte[] bytes)
@@ -138,9 +154,13 @@ public sealed class ClockSettings
     public bool HourPoints { get; }
     public bool Muted { get; }
     public int DateFormat { get; }
+    public ulong BuiltInChimeSound { get; }
     /// Settings field 18 (int32 minutes, firmware 1.6.7+). See ClockTimeCorrection.
     public int TimeOffsetMinutes { get; }
-    public static readonly IReadOnlySet<int> EditableFields = new HashSet<int> { 2, 4, 5, 9, 10, 11, 12 };
+    /// Do Not Disturb (field 1 + permanentDND 3) and Silent (field 14 + permanentMute 4); see ClockSchedule.
+    public ClockSchedule DoNotDisturb { get; }
+    public ClockSchedule Silent { get; }
+    public static readonly IReadOnlySet<int> EditableFields = new HashSet<int> { 2, 4, 5, 9, 10, 11, 12, 15 };
     public const int TimeOffsetField = 18;
 
     public ClockSettings(byte[] data)
@@ -155,6 +175,7 @@ public sealed class ClockSettings
         foreach (var f in message.Fields.Where(f => booleans.Contains(f.Number)))
             if (f.WireType != 0 || f.Integer is not ulong v || v > 1) throw new ProtocolException(ProtocolException.Kind.InvalidSettings);
         if ((message.Integer(5) ?? 0) > 4) throw new ProtocolException(ProtocolException.Kind.InvalidSettings);
+        if (message.Fields.Any(f => f.Number == 15 && f.WireType != 0)) throw new ProtocolException(ProtocolException.Kind.InvalidSettings);
         Raw = payload;
         ulong brightness = message.Integer(10) ?? 0;
         Brightness = (int)(brightness & 255);
@@ -166,7 +187,38 @@ public sealed class ClockSettings
         HourPoints = (message.Integer(9) ?? 0) != 0;
         Muted = (message.Integer(4) ?? 0) != 0;
         DateFormat = (int)(message.Integer(5) ?? 0);
+        BuiltInChimeSound = message.Integer(15) ?? 0;
         TimeOffsetMinutes = message.Integer(TimeOffsetField) is ulong offset ? unchecked((int)offset) : 0;
+        DoNotDisturb = ClockSchedule.Read(message, ScheduleKind.DoNotDisturb);
+        Silent = ClockSchedule.Read(message, ScheduleKind.Silent);
+    }
+
+    public ClockSchedule Schedule(ScheduleKind kind) => kind == ScheduleKind.DoNotDisturb ? DoNotDisturb : Silent;
+
+    /// Replaces only one schedule sub-message (all three required sub-fields) and its permanent flag;
+    /// every other field, known or unknown, is resent byte for byte. Same bytes as bridge patchSchedule.
+    public byte[] PatchedSchedule(ScheduleKind kind, int mode, int from, int till)
+    {
+        if (!ClockSchedule.IsValid(mode, from, till) || !Schedule(kind).Known) throw new ProtocolException(ProtocolException.Kind.InvalidSettings);
+        var message = new WireMessage(Raw);
+        var inner = Bytes.Concat(WireMessage.IntegerField(1, mode == 1 ? 1UL : 0), WireMessage.IntegerField(2, (ulong)from), WireMessage.IntegerField(3, (ulong)till));
+        int number = (int)kind, flag = ClockSchedule.PermanentField(kind);
+        var parts = new List<byte[]>();
+        bool wroteSchedule = false, wroteFlag = false;
+        foreach (var f in message.Fields)
+        {
+            if (f.Number == number) { if (!wroteSchedule) { parts.Add(WireMessage.BytesField(number, inner)); wroteSchedule = true; } }
+            else if (f.Number == flag) { if (!wroteFlag) { parts.Add(WireMessage.IntegerField(flag, mode == 2 ? 1UL : 0)); wroteFlag = true; } }
+            else parts.Add(f.Encoded);
+        }
+        if (!wroteSchedule) parts.Add(WireMessage.BytesField(number, inner));
+        if (!wroteFlag) parts.Add(WireMessage.IntegerField(flag, mode == 2 ? 1UL : 0));
+        return Bytes.Concat(new byte[] { 5, 0, 0, 0 }, Bytes.Concat(parts.ToArray()));
+    }
+    public bool MatchesSchedule(ScheduleKind kind, int mode, int from, int till)
+    {
+        var x = Schedule(kind);
+        return x.Known && x.Mode == mode && x.From == from && x.Till == till;
     }
 
     /// Replaces only field 18; every other field, known or unknown, is resent unchanged.
@@ -187,6 +239,7 @@ public sealed class ClockSettings
         {
             if (field == 10) { if (value > 255) throw new ProtocolException(ProtocolException.Kind.InvalidSettings); }
             else if (field == 5) { if (value > 4) throw new ProtocolException(ProtocolException.Kind.InvalidSettings); }
+            else if (field == 15) { if (value > 17) throw new ProtocolException(ProtocolException.Kind.InvalidSettings); }
             else if (value > 1) throw new ProtocolException(ProtocolException.Kind.InvalidSettings);
         }
         var message = new WireMessage(Raw);
@@ -210,6 +263,37 @@ public sealed class ClockSettings
 }
 
 /// A time as read off the clock or chosen by the owner. Date is optional.
+public enum ScheduleKind { DoNotDisturb = 1, Silent = 14 }
+
+/// The clock's own night schedules (firmware 1.6.7 evaluators 0x1F982 DND and 0x1FA02 Silent):
+/// the permanent flag means always; otherwise `recurring` means from ≤ hour < till (wrapping past
+/// midnight); recurring false is off. Do Not Disturb hides ring overlays (seconds, weather) and
+/// notifications; Silent only mutes sounds, and Silent "Always" is the Mute sounds flag.
+public readonly record struct ClockSchedule(bool Known = true, int Mode = 0, int From = 22, int Till = 8)
+{
+    public ClockSchedule() : this(true, 0, 22, 8) { }
+    public static int PermanentField(ScheduleKind kind) => kind == ScheduleKind.DoNotDisturb ? 3 : 4;
+    public static bool IsValid(int mode, int from, int till) =>
+        mode is >= 0 and <= 2 && from is >= 0 and <= 23 && till is >= 0 and <= 23 && (mode != 1 || from != till);
+    internal static ClockSchedule Read(WireMessage message, ScheduleKind kind)
+    {
+        bool always = (message.Integer(PermanentField(kind)) ?? 0) != 0, recurring = false, malformed = false;
+        int from = 22, till = 8;
+        foreach (var f in message.Fields.Where(f => f.Number == (int)kind))
+        {
+            WireMessage inner;
+            try { inner = new WireMessage(f.Payload ?? throw new ProtocolException(ProtocolException.Kind.Malformed)); }
+            catch (ProtocolException) { malformed = true; continue; }
+            recurring = (inner.Integer(1) ?? 0) != 0;
+            ulong a = inner.Integer(2) ?? (ulong)from, b = inner.Integer(3) ?? (ulong)till;
+            if (a > 23 || b > 23) { malformed = true; continue; }
+            from = (int)a; till = (int)b;
+        }
+        return new ClockSchedule(!malformed, always ? 2 : recurring ? 1 : 0, from, till);
+    }
+    public string Summary => !Known ? "unreadable — not editable" : Mode == 2 ? "always on" : Mode == 1 ? $"scheduled {From:00}:00–{Till:00}:00" : "off";
+}
+
 public readonly record struct WallTime(int Hour, int Minute, DateOnly? Date = null);
 
 /// Setting the clock's time without the Current Time Service.
@@ -320,6 +404,7 @@ public static class GlanceCommands
     public const string ServiceUuid = "5075f606-1e0e-11e7-93ae-92361f002671";
     public const string ControlUuid = "5075fb2e-1e0e-11e7-93ae-92361f002671";
     public const string StateUuid = "5075fc78-1e0e-11e7-93ae-92361f002671";
+    public const string SceneUuid = "5075ffac-1e0e-11e7-93ae-92361f002671";
 
     static readonly int[] Animations = { 0, 1, 2, 10, 11, 12, 15, 17 };
     static readonly int[] Colours = { 5, 12, 15, 18, 23 };
@@ -379,12 +464,18 @@ public sealed class ClockHandState
     public bool AwaitingConfirmation { get; }
     public bool HomingFailure { get; }
     public bool MotorFailure { get; }
+    /// Normal time-adjust movement (256) is NOT calibration; Do Not Disturb active is bit 16.
+    public bool TimeAdjusting { get; }
+    public bool DoNotDisturb { get; }
+    public int Bits { get; }
     public ClockHandState(byte[] data)
     {
         if (data.Length is not (1 or 2)) throw new ProtocolException(ProtocolException.Kind.Malformed);
         int bits = data[0] | (data.Length == 2 ? data[1] << 8 : 0);
+        Bits = bits;
         Homing = (bits & 128) != 0; AwaitingConfirmation = (bits & 1024) != 0;
         HomingFailure = (bits & 64) != 0; MotorFailure = (bits & 2048) != 0;
+        TimeAdjusting = (bits & 256) != 0; DoNotDisturb = (bits & 16) != 0;
     }
 }
 
@@ -548,4 +639,103 @@ public static class Glance
         _ => string.Join(" ", Days.Where((_, i) => (d & (1 << i)) != 0)),
     };
     public static string Hour(int h) => h.ToString("00", CultureInfo.InvariantCulture) + ":00";
+}
+
+/// A single ticking ring pixel (same scenes as the ESP32 bridge's comet.h 1.20/1.21 and the Mac app).
+/// Stock firmware re-initialises a scene whenever it is replaced and refuses long writes, so one
+/// scene is one ≤155-byte write of ~8 steps. Each step is ONE Fill (life 1, Result OK) painting the
+/// new angle in the colour and the previous angle black. Slot 1 is shared with the weather ring.
+public static class SecondsScene
+{
+    public const int Pixels = 48, Fps = 50, MinuteFrames = 3000, WindowSteps = 8, MaxCommand = 155, OuterRing = 1;
+    public const byte Slot = 1;
+    /// Minimum steps a handoff scene fits for each LED mask 1–15 (contiguous 8 = 10 s, gapped 6 = 7.5 s).
+    public static readonly int[] SceneSteps = { 0, 8, 8, 8, 8, 6, 8, 8, 8, 6, 6, 6, 8, 6, 8, 8 };
+    public static bool ValidColor(int c) => c is >= 1 and <= 24;
+    /// Bit 0 = outer ring (segment offset 0) … bit 3 = the LED nearest the centre.
+    public static bool ValidRings(int r) => r is >= 1 and <= 15;
+    public static int PixelAt(int frame) => frame * Pixels / MinuteFrames;
+    public static int BoundaryFrame(int pixel) => (pixel * MinuteFrames + Pixels - 1) / Pixels;
+    static ulong Radial(int pixel, int offset, int heightField, int color) =>
+        (uint)pixel | (uint)color << 16 | (uint)offset << 6 | (uint)heightField << 14;
+    static List<(int Offset, int Height)> RingRuns(int rings)
+    {
+        var runs = new List<(int, int)>();
+        for (int b = 0; b < 4 && runs.Count < 2;)
+        {
+            if ((rings >> b & 1) == 0) { b++; continue; }
+            int lo = b;
+            while (b < 4 && (rings >> b & 1) != 0) b++;
+            runs.Add((lo, b - 1 - lo));
+        }
+        return runs;
+    }
+    static byte[] Fill(int at, byte[] data)
+    {
+        var parts = new List<byte[]> { WireMessage.IntegerField(1, 2) };
+        if (at != 0) parts.Add(WireMessage.IntegerField(2, (ulong)at));
+        parts.Add(WireMessage.IntegerField(3, 1));
+        parts.Add(WireMessage.BytesField(6, data));
+        return Bytes.Concat(parts.ToArray());
+    }
+    static byte[] Build(int frame, int color, bool continuation, int steps, int rings)
+    {
+        int first = PixelAt(frame);
+        var runs = RingRuns(rings);
+        var body = new List<byte[]> { new byte[] { 0, 0, 8, Slot } };   // watchface overlay: the matrix keeps time/date
+        if (!continuation) body.Add(WireMessage.BytesField(1, Fill(0, WireMessage.IntegerField(1, 47 << 8 | 3 << 14))));
+        for (int i = 0; i < steps; i++)
+        {
+            int p = (first + i) % Pixels, previous = (p + Pixels - 1) % Pixels;
+            int at = i == 0 ? 0 : BoundaryFrame(first + i) - frame;
+            var fill = new List<byte[]>();
+            foreach (var r in runs) fill.Add(WireMessage.IntegerField(1, Radial(p, r.Offset, r.Height, color)));
+            foreach (var r in runs) fill.Add(WireMessage.IntegerField(1, Radial(previous, r.Offset, r.Height, 0)));
+            body.Add(WireMessage.BytesField(1, Fill(at, Bytes.Concat(fill.ToArray()))));
+        }
+        return Bytes.Concat(body.ToArray());
+    }
+    /// One scene covering up to WindowSteps steps from `frame` (0..2999, crossing the minute), as many
+    /// as fit in one write; EndPixel (exclusive, may exceed 47) is the first step not covered.
+    public static (byte[] Data, int EndPixel)? Scene(int frame, int color, bool continuation = false, int rings = OuterRing)
+    {
+        if (frame < 0 || frame >= MinuteFrames || !ValidColor(color) || !ValidRings(rings)) return null;
+        for (int steps = WindowSteps; steps >= 1; steps--)
+        {
+            var data = Build(frame, color, continuation, steps, rings);
+            if (data.Length <= MaxCommand) return (data, PixelAt(frame) + steps);
+        }
+        return null;
+    }
+    /// Recognised, active factory alert faces (scene characteristic 5075ffac); bit 7 = inactive.
+    public static bool AlertFace(int scene) =>
+        scene is >= 0 and <= 255 && (scene & 128) == 0 && (scene == 2 || scene == 3 || scene is >= 8 and <= 10);
+    /// The bridge page's 24 native palette colours (Color enum 1–24) with preview RGB.
+    public static readonly (int Id, string Name, uint Rgb)[] Colours =
+    {
+        (1, "Gold", 0xB8860B),
+        (2, "Orange", 0xFF8C00),
+        (3, "Olive", 0x808000),
+        (4, "Orange red", 0xFF4500),
+        (5, "Red", 0xFF3030),
+        (6, "Maroon", 0x800000),
+        (7, "Magenta", 0x8B008B),
+        (8, "Pink", 0xC71585),
+        (9, "Brown", 0xA52A2A),
+        (10, "Indigo", 0x4B0082),
+        (11, "Violet", 0x8A2BE2),
+        (12, "White", 0xF1F7FA),
+        (13, "Slate blue", 0x8470FF),
+        (14, "Royal blue", 0x4169E1),
+        (15, "Blue", 0x2463FF),
+        (16, "Cornflower blue", 0x6495ED),
+        (17, "Sky blue", 0x87CEEB),
+        (18, "Turquoise", 0x40E0D0),
+        (19, "Aqua", 0x00FFFF),
+        (20, "Spring green", 0x00FA9A),
+        (21, "Lime green", 0x32CD32),
+        (22, "Dark green", 0x006400),
+        (23, "Lime", 0x00FF00),
+        (24, "Lawn green", 0x7CFC00)
+    };
 }

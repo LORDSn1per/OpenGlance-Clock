@@ -11,7 +11,7 @@ using GlanceProtocol;
 
 namespace OpenGlance;
 
-public enum TabId { Home, Messages, Alarms, Weather, Display, Clock }
+public enum TabId { Home, Alerts, Alarms, Weather, Display, Clock }
 
 public interface ITab { IEnumerable<Control> Cards { get; } void Refresh(); }
 
@@ -21,7 +21,14 @@ public sealed class AppModel
     public AlarmStore Alarms { get; }
     public ChimeService Chime { get; }
     public WeatherService Weather { get; }
-    public AppModel() { Alarms = new AlarmStore(Clock); Chime = new ChimeService(Clock); Weather = new WeatherService(Clock); }
+    public SecondsService Seconds { get; }
+    public AppModel()
+    {
+        Alarms = new AlarmStore(Clock); Chime = new ChimeService(Clock); Weather = new WeatherService(Clock);
+        Seconds = new SecondsService(Clock, Alarms, Chime, Weather);
+    }
+    /// Removes the seconds scene first, so no stopped pixel stays on the ring.
+    public void Disconnect(bool forget = false) => Seconds.Release(() => { if (forget) Clock.ForgetClock(); else Clock.Disconnect(); });
 }
 
 public sealed class MainWindow : Window
@@ -87,7 +94,7 @@ public sealed class MainWindow : Window
 
         var clock = model.Clock;
         tabs[TabId.Home] = new HomeTab(this, model);
-        tabs[TabId.Messages] = new MessagesTab(model);
+        tabs[TabId.Alerts] = new MessagesTab(model);
         tabs[TabId.Alarms] = new AlarmsTab(this, model);
         tabs[TabId.Weather] = new WeatherTab(model);
         tabs[TabId.Display] = new DisplayTab(model);
@@ -96,12 +103,19 @@ public sealed class MainWindow : Window
         clock.Changed += QueueRefresh;
         model.Alarms.Changed += QueueRefresh;
         model.Weather.Changed += QueueRefresh;
+        model.Seconds.Changed += QueueRefresh;
         clock.ShowError = message => Dialogs.Alert(this, message);
         clock.AskPin = () => Dialogs.Ask(this, "Enter the clock's PIN", "Type the PIN shown on the clock's display.", "PIN");
         var tick = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         tick.Tick += (_, _) => Refresh();
         tick.Start();
-        Closing += (_, _) => clock.Disconnect();
+        bool released = false;
+        Closing += (_, e) =>
+        {
+            if (released) { clock.Disconnect(); return; }
+            e.Cancel = true; released = true;
+            model.Seconds.Release(() => { clock.Disconnect(); Close(); });
+        };
         Show(TabId.Home);
     }
 
@@ -144,8 +158,9 @@ public sealed class MainWindow : Window
         batteryPill.IsVisible = clock.Battery is not null;
         if (clock.Battery is int b2) Ui.SetPill(batteryPill, batteryText, batteryDot, $"Battery {b2}%", b2 > 20 ? PillKind.Good : PillKind.Mid);
         var w = model.Weather;
-        weatherPill.IsVisible = w.Options.On;
-        Ui.SetPill(weatherPill, weatherText, weatherDot, w.Showing == 0 ? "Weather off" : w.RainDue ? "Rain coming" : "Weather on ring", PillKind.Plain);
+        weatherPill.IsVisible = w.Options.On || model.Seconds.On;
+        Ui.SetPill(weatherPill, weatherText, weatherDot, model.Seconds.On ? (model.Seconds.Running ? "Seconds on ring" : "Seconds paused")
+            : w.Showing == 0 ? "Weather off" : w.RainDue ? "Rain coming" : "Weather on ring", PillKind.Plain);
         tabs[Tab].Refresh();
         if (activityCard is not null)
         {
@@ -189,7 +204,7 @@ sealed class HomeTab : ITab
         big = Ui.Big(); status = Ui.Note();
         var (g, values) = Ui.KV("Clock", "Battery", "Hands"); kv = values;
         connect = Ui.Btn("Connect", Kind.Secondary, () => c.ConnectSaved());
-        disconnect = Ui.Btn("Disconnect", Kind.Secondary, () => c.Disconnect());
+        disconnect = Ui.Btn("Disconnect", Kind.Secondary, () => m.Disconnect());
         refresh = Ui.Btn("Refresh", Kind.Secondary, () => c.RefreshSettings());
         clockCard = Ui.Card("Clock", big, status, g, Ui.Row(connect, disconnect, refresh), Ui.Note("Set the clock's time on the Clock tab."));
         weatherBig = Ui.Big(); weatherNote = Ui.Note();
@@ -209,7 +224,7 @@ sealed class HomeTab : ITab
         disconnect.IsEnabled = c.IsConnected;
         refresh.IsEnabled = c.CanControl && !c.DemoMode;
         weatherBig.Text = w.Options.On && w.Forecast?.Current is double t ? $"{Math.Round(t, MidpointRounding.AwayFromZero)}°{(w.Options.Fahrenheit ? "F" : "C")}" : "—";
-        weatherNote.Text = w.Options.On ? $"{w.Place?.Name ?? "No location"} · ring: {(w.Showing == 0 ? "nothing" : w.RainDue ? "rain coming" : "temperature")}" : "Weather ring is off";
+        weatherNote.Text = m.Seconds.On ? "Paused while the seconds pixel uses the ring" : w.Options.On ? $"{w.Place?.Name ?? "No location"} · ring: {(w.Showing == 0 ? "nothing" : w.RainDue ? "rain coming" : "temperature")}" : "Weather ring is off";
     }
 }
 
@@ -218,11 +233,13 @@ sealed class HomeTab : ITab
 sealed class MessagesTab : ITab
 {
     readonly AppModel m;
-    readonly Border message, timer, chime;
+    readonly Border message, timer, chime, builtInChime;
+    readonly ComboBox builtInSound;
+    readonly TextBlock builtInState = Ui.Note();
     readonly TextBlock countdown;
     readonly List<Control> needsClock = new();
     readonly CheckBox chimeBox;
-    public IEnumerable<Control> Cards => new Control[] { message, timer, chime };
+    public IEnumerable<Control> Cards => new Control[] { message, timer, chime, builtInChime };
 
     public MessagesTab(AppModel m)
     {
@@ -259,9 +276,20 @@ sealed class MessagesTab : ITab
         var chimeSound = Ui.SoundPicker(ch.Sound, false, v => ch.Sound = v, c, () => ch.Sound, out _);
         needsClock.Add(((StackPanel)chimeSound).Children[1]);
         var hours = Enumerable.Range(0, 24).Select(h => (h, Glance.Hour(h)));
-        chime = Ui.Card("Hourly chime", chimeRow, Ui.Note("Sound"), chimeSound, Ui.Note("Quiet hours (no chime)"),
+        chime = Ui.Card("App hourly chime", chimeRow, Ui.Note("Sound"), chimeSound, Ui.Note("Quiet hours (no chime)"),
             Ui.Wrap(Ui.Note("From"), Ui.Combo(hours, ch.QuietFrom, v => ch.QuietFrom = v), Ui.Note("To"), Ui.Combo(hours, ch.QuietTo, v => ch.QuietTo = v)),
             Ui.Note("Set both to the same hour to chime around the clock. The clock also mutes sounds in its own night mode."));
+        builtInSound = new ComboBox { ItemsSource = Glance.Sounds.Select((s, i) => i == 0 ? "Off" : s).ToList(), MinWidth = 180 };
+        builtInSound.SelectionChanged += (_, _) => {
+            if (builtInSound.Tag is null && builtInSound.SelectedIndex is >= 0 and <= 17)
+                c.ChangeSettings(new Dictionary<int, ulong> { [15] = (ulong)builtInSound.SelectedIndex });
+        };
+        var readBuiltIn = Ui.Btn("Read clock settings", Kind.Secondary, () => c.RefreshSettings());
+        needsClock.Add(readBuiltIn);
+        builtInChime = Ui.Card("Clock’s built-in hourly chime",
+            Ui.Note("A separate sound saved in the clock. It can play with this app closed. The app’s quiet hours do not control it."),
+            Ui.Note("Saved sound"), builtInSound, builtInState, Ui.Row(readBuiltIn),
+            Ui.Note("Off stops only this chime, not alarms, timers or messages. Each change is read back. Leave this Off when using the app chime to avoid two sounds."));
     }
 
     public void Refresh()
@@ -271,6 +299,17 @@ sealed class MessagesTab : ITab
         var left = c.TimerEnd is DateTime end ? (int)Math.Max(0, (end - DateTime.Now).TotalSeconds) : 0;
         countdown.Text = left > 0 ? $"{left / 60}:{left % 60:00}" : "—";
         chimeBox.SetQuietly(m.Chime.On);
+        var saved = c.Settings?.BuiltInChimeSound;
+        builtInSound.IsEnabled = c.CanControl && saved is not null;
+        if (!builtInSound.IsDropDownOpen) {
+            builtInSound.Tag = "quiet";
+            builtInSound.ItemsSource = Glance.Sounds.Select((s, i) => i == 0 ? "Off" : s)
+                .Concat(saved > 17 ? new[] { $"Unknown sound ({saved})" } : Array.Empty<string>()).ToList();
+            builtInSound.SelectedIndex = saved is null ? -1 : saved <= 17 ? (int)saved : 18;
+            builtInSound.Tag = null;
+        }
+        builtInState.Text = saved is null ? "Connect the clock to read its saved sound." :
+            "Read from clock: " + (saved == 0 ? "Off" : saved <= 17 ? Glance.Sounds[(int)saved] : $"Unknown sound ({saved})");
     }
 }
 
@@ -499,7 +538,8 @@ sealed class WeatherTab : ITab
         cycleRow.IsVisible = o.RainMode == 1 && o.Temperature;
         rainRules.IsVisible = o.RainMode != 0;
         update.IsEnabled = o.On && w.Place is not null;
-        status.Text = !o.On ? "Weather ring is off."
+        status.Text = m.Seconds.On ? "Paused while the seconds pixel is on (Display tab). Your weather settings are kept."
+            : !o.On ? "Weather ring is off."
             : w.Error ?? (w.Fetched is DateTime f ? $"Forecast updated {f:HH:mm}" + (w.Sent is DateTime s ? $" · sent to clock {s:HH:mm}" : "")
             : w.Place is null ? "Choose a location below." : "Waiting for the first forecast…");
         current.Text = "Current: " + (w.Place?.Name ?? "not set");
@@ -558,7 +598,9 @@ sealed class DisplayTab : ITab
     readonly TextBlock lowNote, highNote, manualNote;
     readonly Control autoPanel, manualPanel;
     readonly List<Control> needsClock = new();
-    public IEnumerable<Control> Cards => new Control[] { display, brightness };
+    readonly NightCard night;
+    readonly SecondsCard seconds;
+    public IEnumerable<Control> Cards => new Control[] { display, brightness, night.Card, seconds.Card };
 
     public DisplayTab(AppModel m)
     {
@@ -597,6 +639,8 @@ sealed class DisplayTab : ITab
         manualPanel = new StackPanel { Spacing = 6, Children = { manualNote, manual } };
         needsClock.Add(autoPanel); needsClock.Add(manualPanel);
         brightness = Ui.Card("Brightness", autoRow, autoPanel, manualPanel);
+        night = new NightCard(m.Clock);
+        seconds = new SecondsCard(m);
     }
 
     static void Quiet(Slider s, double v) { s.Tag = "quiet"; s.Value = v; s.Tag = null; }
@@ -630,6 +674,171 @@ sealed class DisplayTab : ITab
             Quiet(low, s.AutomaticBrightnessLow); Quiet(high, s.AutomaticBrightnessHigh);
             lowNote.Text = $"Minimum (darkest) {(int)low.Value}"; highNote.Text = $"Maximum (brightest) {(int)high.Value}"; manualNote.Text = $"Fixed brightness {(int)manual.Value}";
         }
+        night.Refresh();
+        seconds.Refresh();
+    }
+}
+
+// Night settings (clock DND and Silent schedules), as on the bridge page 1.22.
+sealed class NightCard
+{
+    readonly ClockController c;
+    public Border Card { get; }
+    sealed class Row
+    {
+        public ScheduleKind Kind; public ComboBox Mode = null!, From = null!, Till = null!; public Control Hours = null!;
+        public Button Save = null!; public TextBlock Read = null!; public bool Dirty;
+    }
+    readonly Row[] rows;
+    static readonly (int, string)[] Modes = { (0, "Off"), (1, "Scheduled"), (2, "Always") };
+    static readonly (int, string)[] HourItems = Enumerable.Range(0, 24).Select(h => (h, $"{h:00}:00")).ToArray();
+
+    public NightCard(ClockController clock)
+    {
+        c = clock;
+        var controls = new List<Control> { Ui.Note("Stored on the clock. Do Not Disturb hides the seconds, the weather ring and notifications. Silent only mutes sounds, so the seconds stay visible.") };
+        rows = new[] { Make(ScheduleKind.DoNotDisturb, "Do Not Disturb", "Save Do Not Disturb", controls), Make(ScheduleKind.Silent, "Silent (quiet hours)", "Save Silent", controls) };
+        controls.Add(Ui.Note("Silent “Always” is the same as Mute sounds above. Timers and alarms may still sound while muted. For quiet nights with the seconds visible, turn Do Not Disturb off and schedule Silent for the same hours."));
+        Card = Ui.Card("Night settings", controls.ToArray());
+    }
+    Row Make(ScheduleKind kind, string title, string save, List<Control> controls)
+    {
+        var r = new Row { Kind = kind };
+        void Edited() { r.Dirty = true; Update(r); }
+        r.Mode = Ui.Combo(Modes, 0, _ => Edited());
+        r.From = Ui.Combo(HourItems, 22, _ => Edited()); r.From.MinWidth = 90;
+        r.Till = Ui.Combo(HourItems, 8, _ => Edited()); r.Till.MinWidth = 90;
+        r.Hours = Ui.Row(Ui.Note("from"), r.From, Ui.Note("to"), r.Till);
+        r.Save = Ui.Btn(save, Kind.Secondary, () =>
+        {
+            r.Dirty = false;
+            c.SetSchedule(kind, Modes[r.Mode.SelectedIndex].Item1, r.From.SelectedIndex, r.Till.SelectedIndex);
+        });
+        r.Read = Ui.Note();
+        controls.Add(Ui.Text(title, 14, FontWeight.SemiBold));
+        controls.Add(Ui.Wrap(r.Mode, r.Hours));
+        controls.Add(Ui.Wrap(r.Save, r.Read));
+        return r;
+    }
+    void Update(Row r)
+    {
+        var read = c.Settings?.Schedule(r.Kind);
+        bool scheduled = r.Mode.SelectedIndex == 1, same = r.From.SelectedIndex == r.Till.SelectedIndex;
+        r.Hours.IsVisible = scheduled;
+        bool editable = c.CanControl && (read?.Known ?? false);
+        r.Mode.IsEnabled = r.From.IsEnabled = r.Till.IsEnabled = editable;
+        r.Save.IsEnabled = editable && !(scheduled && same);
+        r.Read.Text = scheduled && same ? "Start and end hours must differ." : "Read from clock: " + (read?.Summary ?? "not read yet");
+    }
+    public void Refresh()
+    {
+        foreach (var r in rows)
+        {
+            if (!r.Dirty && c.Settings?.Schedule(r.Kind) is ClockSchedule s)
+            {
+                r.Mode.SelectQuietly(Modes, s.Mode); r.From.SelectQuietly(HourItems, s.From); r.Till.SelectQuietly(HourItems, s.Till);
+            }
+            Update(r);
+        }
+    }
+}
+
+// Seconds pixel (bridge 1.20/1.21 single ticking pixel with LED choice), while this app is open.
+sealed class SecondsCard
+{
+    readonly AppModel m;
+    public Border Card { get; }
+    readonly CheckBox on;
+    readonly ComboBox colour;
+    readonly Ellipse swatch;
+    readonly Button[] leds = new Button[4];
+    readonly TextBlock ledNote, status, dndNote;
+    readonly Button retry;
+    readonly Ellipse[,] dots = new Ellipse[4, 48];
+    static readonly (int, string)[] Colours = SecondsScene.Colours.Select(c => (c.Id, c.Name)).ToArray();
+    static readonly IBrush Unlit = new SolidColorBrush(Color.FromArgb(70, 159, 176, 186));
+
+    public SecondsCard(AppModel model)
+    {
+        m = model;
+        var s = m.Seconds;
+        var (onRow, onBox) = Ui.Switch("Show a ticking seconds pixel", "Runs while this app is open and connected", v => s.Apply(v, s.Color, s.Rings));
+        on = onBox;
+        colour = Ui.Combo(Colours, s.Color, v => s.Apply(s.On, v, s.Rings)); colour.MinWidth = 180;
+        swatch = new Ellipse { Width = 14, Height = 14 };
+        var ledRow = new List<Control> { Ui.Note("Outer") };
+        for (int bit = 0; bit < 4; bit++)
+        {
+            int b = bit;
+            var btn = Ui.Btn((bit + 1).ToString(), Kind.Secondary, () =>
+            {
+                int next = s.Rings ^ (1 << b);
+                if (next != 0) s.Apply(s.On, s.Color, next);
+            });
+            btn.MinWidth = 40;
+            ToolTip.SetTip(btn, bit == 0 ? "Outer ring" : bit == 3 ? "Nearest the centre" : $"Ring {bit + 1}");
+            leds[bit] = btn; ledRow.Add(btn);
+        }
+        ledRow.Add(Ui.Note("Centre"));
+        ledNote = Ui.Note();
+        var canvas = new Canvas { Width = 150, Height = 150 };
+        double[] radii = { 64, 56, 48, 40 };
+        for (int ring = 0; ring < 4; ring++)
+            for (int i = 0; i < 48; i++)
+            {
+                double a = i * Math.PI / 24 - Math.PI / 2, x = (80 + radii[ring] * Math.Cos(a)) * 150 / 160, y = (80 + radii[ring] * Math.Sin(a)) * 150 / 160;
+                var d = new Ellipse { Width = 4.9, Height = 4.9, Fill = Unlit };
+                Canvas.SetLeft(d, x - 2.45); Canvas.SetTop(d, y - 2.45);
+                canvas.Children.Add(d); dots[ring, i] = d;
+            }
+        var preview = new Border { Width = 150, Height = 150, CornerRadius = new CornerRadius(75), Background = new SolidColorBrush(Color.FromRgb(0x1C, 0x23, 0x28)), Child = canvas, VerticalAlignment = VerticalAlignment.Top };
+        var side = new StackPanel { Spacing = 8, Children = { Ui.Row(Ui.Note("Colour"), colour, swatch), Ui.Note("LEDs that light"), Ui.Row(ledRow.ToArray()), ledNote,
+            Ui.Note("One lap per minute · one step every 1.25 s · illustrative preview") } };
+        var top = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
+        side.Margin = new Thickness(18, 0, 0, 0); Grid.SetColumn(side, 1);
+        top.Children.Add(preview); top.Children.Add(side);
+        status = Ui.Text("", 14, FontWeight.SemiBold);
+        retry = Ui.Btn("Retry", Kind.Secondary, () => s.Retry());
+        dndNote = Ui.Note();
+        Card = Ui.Card("Seconds pixel", onRow, top, Ui.Row(status, retry), dndNote,
+            Ui.Note("Pauses for Do Not Disturb, timers, alarms, chimes and calibration; messages get a 90-second pause. Uses the weather ring's slot; weather comes back when seconds are off. The clock redraws each new scene, so expect a small blip and a time/date switch about every 10 s."));
+        var tick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        tick.Tick += (_, _) => { if (Card.IsEffectivelyVisible) Animate(); };
+        tick.Start();
+    }
+
+    void Animate()
+    {
+        var s = m.Seconds;
+        var now = DateTime.Now;
+        int head = SecondsScene.PixelAt((now.Second * 1000 + now.Millisecond) * SecondsScene.Fps / 1000);
+        uint rgb = SecondsScene.Colours.First(c => c.Id == s.Color).Rgb;
+        var lit = new SolidColorBrush(Color.FromRgb((byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb));
+        for (int ring = 0; ring < 4; ring++)
+            for (int i = 0; i < 48; i++)
+                dots[ring, i].Fill = i == head && (s.Rings >> ring & 1) != 0 ? lit : Unlit;
+    }
+
+    public void Refresh()
+    {
+        var s = m.Seconds; var c = m.Clock;
+        on.SetQuietly(s.On);
+        colour.SelectQuietly(Colours, s.Color);
+        uint rgb = SecondsScene.Colours.First(x => x.Id == s.Color).Rgb;
+        swatch.Fill = new SolidColorBrush(Color.FromRgb((byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb));
+        int count = 0;
+        for (int bit = 0; bit < 4; bit++)
+        {
+            bool lit = (s.Rings >> bit & 1) != 0;
+            if (lit) count++;
+            leds[bit].Res(TemplatedControl.BackgroundProperty, lit ? "Teal" : "TealBg").Res(TemplatedControl.ForegroundProperty, lit ? "White" : "TealInk");
+        }
+        for (int bit = 0; bit < 4; bit++) leds[bit].IsEnabled = !((s.Rings >> bit & 1) != 0 && count == 1);
+        ledNote.Text = $"{count} LED{(count == 1 ? "" : "s")} · new clock scene about every " + (SecondsScene.SceneSteps[s.Rings] == 8 ? "10 s" : "7.5 s (a gap between lit LEDs needs two segments per step)");
+        status.Text = s.Status;
+        retry.IsVisible = s.Failed;
+        dndNote.Text = $"Clock Do Not Disturb: {(c.HandState is null ? "not read" : c.DoNotDisturbActive ? "active" : "inactive")}. Automatic night mode is a separate setting.";
+        Animate();
     }
 }
 
@@ -677,7 +886,7 @@ sealed class ClockTab : ITab
         find = Ui.Btn("Find clocks", Kind.Primary, () => c.Scan());
         forget = Ui.Btn("Forget clock", Kind.Danger, async () =>
         {
-            if (await Dialogs.Confirm(window, "Forget the saved clock?", "Removes the clock remembered by this app. It never resets the clock or clears its pairings.", "Forget", danger: true)) c.ForgetClock();
+            if (await Dialogs.Confirm(window, "Forget the saved clock?", "Removes the clock remembered by this app. It never resets the clock or clears its pairings.", "Forget", danger: true)) m.Disconnect(forget: true);
         });
         var forgetGroup = new Expander { Header = "Forget the saved clock", Content = new StackPanel { Spacing = 8, Children = {
             Ui.Note("Removes the clock remembered by this app. It never resets the clock or clears its pairings."), Ui.Row(forget) } } };

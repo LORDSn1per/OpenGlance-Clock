@@ -60,7 +60,10 @@ public sealed class App : Application
         model.Weather.LoadDemo(f);
         if (Args.Contains("--fill"))
             Store.State.Alarms.Add(new AlarmEntry { Hour = 6, Minute = 45, Days = 31, Sound = 6, Text = "Wake" });
-        var tab = Enum.GetValues<TabId>().FirstOrDefault(t => t.ToString().Equals(Arg("--tab", "home"), StringComparison.OrdinalIgnoreCase));
+        var tabName = Arg("--tab", "home");
+        if (tabName.Equals("messages", StringComparison.OrdinalIgnoreCase)) tabName = "alerts";
+        var tab = Enum.GetValues<TabId>().FirstOrDefault(t => t.ToString().Equals(tabName, StringComparison.OrdinalIgnoreCase));
+        if (Args.Contains("--seconds")) model.Seconds.Apply(true, 18, 3);
         window.Opened += async (_, _) =>
         {
             window.Show(tab);

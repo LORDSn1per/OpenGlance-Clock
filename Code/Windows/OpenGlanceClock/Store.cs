@@ -18,6 +18,9 @@ public sealed class StoredState
     public int QuietTo { get; set; } = 7;
     public WeatherOptions Weather { get; set; } = new();
     public WeatherPlace? Place { get; set; }
+    public bool SecondsOn { get; set; }
+    public int SecondsColor { get; set; } = 18;
+    public int SecondsRings { get; set; } = 1;
 }
 
 public sealed record WeatherPlace(string Name, double Latitude, double Longitude);

@@ -1,5 +1,22 @@
 # OpenGlance Clock
 
+## Night settings, seconds pixel and Alerts — 0.33
+
+Same features as bridge page 1.22, over the app's own Bluetooth connection (Mac and Windows 0.33 are built together):
+
+- **Display → Night settings** shows and edits the clock's own **Do Not Disturb** (field 1 + permanent flag 3) and **Silent** (field 14 + Mute flag 4) schedules: Off, Scheduled from–to, or Always. Do Not Disturb hides the seconds, weather ring and notifications; Silent only mutes sounds. Each save reads fresh settings, replaces only that schedule (every other field, including the time offset, is kept byte for byte), then reads back and logs "Confirmed by the clock". For quiet nights with the seconds visible: Do Not Disturb Off, Silent scheduled.
+- **Display → Seconds pixel**: a single ticking pixel, any of the 24 clock colours, and a choice of which of the 4 radial LEDs light (contiguous = a new clock scene about every 10 s; a gap = about every 7.5 s). It runs only while the app is open and connected, shares the weather ring's slot (weather pauses and returns when seconds are off), and pauses for clock Do Not Disturb, timers, alarms, chimes, calibration and alert faces; messages get a 90-second pause. Disconnect, Forget and Quit remove the scene first, so no stopped pixel is left on the ring. A Bluetooth error stops it until Retry; a dropped connection simply starts fresh on reconnect.
+- **Messages is now Alerts**, as on the bridge page.
+- Scenes and night-setting writes are byte-identical to the bridge (golden vectors plus a hash over every scene and every night patch in the checks). Background sends no longer mark the app busy, so the controls never grey out while the seconds run.
+
+Not yet tested on hardware from the desktop apps: the seconds pixel over the Mac/Windows Bluetooth link (the bridge's version is owner-confirmed) and the night-setting writes.
+
+## Built-in hourly chime — 0.32
+
+Messages now separates **App hourly chime** from **Clock’s built-in hourly chime**. The latter controls the saved Settings field 15 (`charmSound`): **Off** (0) or a sound (1–17), showing the value read from the clock with a Read clock settings button. Changes use fresh settings and read-back verification, preserving all other fields including time offset 18. Unknown sounds are displayed and retained by unrelated edits.
+
+This chime can play with the app closed; app quiet hours do not control it. Off leaves alarms, timers, messages and global Mute unchanged. Keep it Off when using the app/bridge chime to avoid duplicates. Mac and Windows 0.32 are built together. Desktop apps need direct Bluetooth access, so disconnect the bridge first. Native silencing/persistence still await hardware testing.
+
 A calm, cloud-free native Mac companion for the original Glance Clock, with a softer slate/charcoal-and-teal theme. Requires macOS 14 or newer; the supplied app is built for Apple Silicon. See Hardware-status.md for the owner's latest test results.
 
 ## Project storage and releases

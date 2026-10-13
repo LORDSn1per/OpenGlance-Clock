@@ -153,9 +153,14 @@ final class AppModel: ObservableObject {
     lazy var alarms = AlarmStore(clock: clock)
     lazy var chime = ChimeService(clock: clock)
     lazy var weather = WeatherService(clock: clock)
+    lazy var seconds = SecondsService(clock: clock, alarms: alarms, chime: chime, weather: weather)
+    /// Removes the seconds scene first, so no stopped pixel stays on the ring.
+    func disconnect(forget: Bool = false) {
+        seconds.release { [clock] in if forget { clock.forgetClock() } else { clock.disconnect() } }
+    }
 }
 
-enum Tab: String, CaseIterable { case home = "Home", messages = "Messages", alarms = "Alarms", weather = "Weather", display = "Display", clock = "Clock" }
+enum Tab: String, CaseIterable { case home = "Home", alerts = "Alerts", alarms = "Alarms", weather = "Weather", display = "Display", clock = "Clock" }
 
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -167,16 +172,18 @@ struct OpenGlanceApp: App {
     @StateObject private var model = AppModel()
     var body: some Scene {
         WindowGroup("OpenGlance Clock", id: "main") {
-            RootView(model: model, clock: model.clock, alarms: model.alarms, chime: model.chime, weather: model.weather)
+            RootView(model: model, clock: model.clock, alarms: model.alarms, chime: model.chime, weather: model.weather, seconds: model.seconds)
                 .onAppear { if !Screenshot.runIfRequested(model) { model.clock.connectSavedOnLaunch() } }
         }
         .defaultSize(width: 1100, height: 800)
         .commands {
             CommandGroup(replacing: .appTermination) {
                 Button("Quit OpenGlance Clock") {
-                    model.clock.disconnect()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { NSApp.terminate(nil) }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(EXIT_SUCCESS) }   // no documents to save
+                    model.seconds.release {
+                        model.clock.disconnect()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { NSApp.terminate(nil) }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(EXIT_SUCCESS) }   // no documents to save
+                    }
                 }.keyboardShortcut("q")
             }
         }
@@ -189,6 +196,7 @@ struct RootView: View {
     @ObservedObject var alarms: AlarmStore
     @ObservedObject var chime: ChimeService
     @ObservedObject var weather: WeatherService
+    @ObservedObject var seconds: SecondsService
     @ViewState var tab: Tab = .home
 
     var body: some View {
@@ -199,12 +207,12 @@ struct RootView: View {
                 VStack(spacing: 16) {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 360), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {
                         switch tab {
-                        case .home: HomeTab(clock: clock, weather: weather, go: { tab = $0 })
-                        case .messages: MessagesTab(clock: clock, chime: chime)
+                        case .home: HomeTab(model: model, clock: clock, weather: weather, seconds: seconds, go: { tab = $0 })
+                        case .alerts: MessagesTab(clock: clock, chime: chime)
                         case .alarms: AlarmsTab(clock: clock, store: alarms)
-                        case .weather: WeatherTab(weather: weather)
-                        case .display: DisplayTab(clock: clock)
-                        case .clock: ClockTab(clock: clock)
+                        case .weather: WeatherTab(weather: weather, secondsOn: seconds.on)
+                        case .display: DisplayTab(clock: clock, seconds: seconds)
+                        case .clock: ClockTab(model: model, clock: clock)
                         }
                     }
                     if tab == .home { Card(title: "Recent activity") { LogList(events: Array(clock.events.prefix(6))) } }
@@ -233,7 +241,8 @@ struct RootView: View {
             Spacer()
             Pill(text: "Clock: \(stateInfo.0)", kind: stateInfo.1)
             if let b = clock.battery { Pill(text: "Battery \(b)%", kind: b > 20 ? .good : .mid) }
-            if weather.options.on { Pill(text: weather.showing == 0 ? "Weather off" : weather.rainDue ? "Rain coming" : "Weather on ring", kind: .plain) }
+            if seconds.on { Pill(text: seconds.running ? "Seconds on ring" : "Seconds paused", kind: .plain) }
+            else if weather.options.on { Pill(text: weather.showing == 0 ? "Weather off" : weather.rainDue ? "Rain coming" : "Weather on ring", kind: .plain) }
         }
         .padding(.horizontal, 18).padding(.vertical, 12)
         .background(Theme.card).overlay(alignment: .bottom) { Rectangle().fill(Theme.line).frame(height: 1) }
@@ -260,8 +269,10 @@ struct RootView: View {
 // MARK: Home
 
 struct HomeTab: View {
+    let model: AppModel
     @ObservedObject var clock: BluetoothController
     @ObservedObject var weather: WeatherService
+    @ObservedObject var seconds: SecondsService
     let go: (Tab) -> Void
     var body: some View {
         if !clock.hasRememberedClock && !clock.demoMode {
@@ -278,14 +289,14 @@ struct HomeTab: View {
                       ("Hands", clock.handStatus)])
             HStack {
                 Button("Connect") { clock.scan(reconnect: true) }.og(.secondary).disabled(clock.isConnected || clock.isConnecting || !clock.hasRememberedClock)
-                Button("Disconnect") { clock.disconnect() }.og(.secondary).disabled(!clock.isConnected)
+                Button("Disconnect") { model.disconnect() }.og(.secondary).disabled(!clock.isConnected)
                 Button("Refresh") { clock.refreshSettings() }.og(.secondary).disabled(!clock.canControl || clock.demoMode)
             }
             Text("Setting the clock's time needs the OpenGlance Bridge; macOS does not allow it.").note()
         }
         Card(title: "Weather") {
             Big(text: weather.options.on ? weather.forecast?.current.map { "\(Int($0.rounded()))°\(weather.options.fahrenheit ? "F" : "C")" } ?? "—" : "—")
-            Text(weather.options.on ? "\(weather.place?.name ?? "No location") · ring: \(weather.showing == 0 ? "nothing" : weather.rainDue ? "rain coming" : "temperature")" : "Weather ring is off").note()
+            Text(seconds.on ? "Paused while the seconds pixel uses the ring" : weather.options.on ? "\(weather.place?.name ?? "No location") · ring: \(weather.showing == 0 ? "nothing" : weather.rainDue ? "rain coming" : "temperature")" : "Weather ring is off").note()
             Button("Weather settings →") { go(.weather) }.buttonStyle(.plain).foregroundStyle(Theme.tealInk).font(.system(size: 14, weight: .semibold))
         }
     }
@@ -331,7 +342,7 @@ struct MessagesTab: View {
                 }
             }
         }
-        Card(title: "Hourly chime") {
+        Card(title: "App hourly chime") {
             SwitchRow(title: "Chime every hour", detail: "Shows the time with a sound, while this app is open", isOn: chime.on) { chime.on = $0 }
             Text("Sound").note()
             SoundPicker(sound: $chime.sound, clock: clock)
@@ -341,6 +352,18 @@ struct MessagesTab: View {
                 Picker("To", selection: $chime.quietTo) { ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) } }
             }
             Text("Set both to the same hour to chime around the clock. The clock also mutes sounds in its own night mode.").note()
+        }
+        Card(title: "Clock’s built-in hourly chime") {
+            Text("A separate sound saved in the clock. It can play with this app closed. The app’s quiet hours do not control it.").note()
+            Picker("Saved sound", selection: Binding(get: { clock.settings?.builtInChimeSound ?? 0 }, set: { clock.changeSettings([15: $0]) })) {
+                ForEach(0..<Glance.sounds.count, id: \.self) { n in Text(n == 0 ? "Off" : Glance.sounds[n]).tag(UInt64(n)) }
+                if let value = clock.settings?.builtInChimeSound, value > 17 { Text("Unknown sound (\(value))").tag(value) }
+            }.disabled(!clock.canControl || clock.settings == nil)
+            if let value = clock.settings?.builtInChimeSound {
+                Text("Read from clock: \(value == 0 ? "Off" : value <= 17 ? Glance.sounds[Int(value)] : "Unknown sound (\(value))")").note()
+            } else { Text("Connect the clock to read its saved sound.").note() }
+            Button("Read clock settings") { clock.refreshSettings() }.og(.secondary).disabled(!clock.canControl)
+            Text("Off stops only this chime, not alarms, timers or messages. Each change is read back. Leave this Off when using the app chime to avoid two sounds.").note()
         }
     }
 }
@@ -432,6 +455,7 @@ struct AlarmEditor: View {
 
 struct WeatherTab: View {
     @ObservedObject var weather: WeatherService
+    var secondsOn = false
     @ViewState private var query = ""
     @ViewState private var results: [WeatherService.Place] = []
     @ViewState private var searching = false
@@ -463,6 +487,7 @@ struct WeatherTab: View {
             }
             Button("Update forecast now") { Task { await weather.fetch(user: true) } }.og(.secondary).disabled(!weather.options.on || weather.place == nil)
             Text(status).note()
+            if secondsOn { Text("Paused while the seconds pixel is on (Display tab). Your weather settings are kept.").font(.system(size: 13)).foregroundStyle(Theme.warn) }
             Text("Works while this app is open. The clock hides the rings by itself in night mode.").note()
         }
         .onAppear { mm = weather.options.rainMm; chance = Double(weather.options.rainChance); coldAt = weather.options.coldAt; hotAt = weather.options.hotAt }
@@ -536,6 +561,7 @@ struct WeatherPreview: View {
 
 struct DisplayTab: View {
     @ObservedObject var clock: BluetoothController
+    @ObservedObject var seconds: SecondsService
     @ViewState private var manual = 128.0
     @ViewState private var low = 30.0
     @ViewState private var high = 220.0
@@ -570,6 +596,8 @@ struct DisplayTab: View {
         }
         .disabled(!clock.canControl)
         .onAppear(perform: sync).onChange(of: clock.settings) { _, _ in sync() }
+        NightCard(clock: clock)
+        SecondsCard(clock: clock, seconds: seconds)
     }
     private func setting(_ title: String, _ value: Bool, _ field: Int) -> some View {
         SwitchRow(title: title, isOn: value) { clock.changeSettings([field: $0 ? 1 : 0]) }.disabled(!clock.canControl)
@@ -581,9 +609,127 @@ struct DisplayTab: View {
     }
 }
 
+// MARK: Night settings (clock DND and Silent schedules)
+
+struct NightCard: View {
+    @ObservedObject var clock: BluetoothController
+    @ViewState private var draft: [ClockSchedule.Kind: ClockSchedule] = [:]
+    @ViewState private var dirty: Set<ClockSchedule.Kind> = []
+    var body: some View {
+        Card(title: "Night settings") {
+            Text("Stored on the clock. **Do Not Disturb** hides the seconds, the weather ring and notifications. **Silent** only mutes sounds, so the seconds stay visible.").note()
+            row(.doNotDisturb, "Do Not Disturb", save: "Save Do Not Disturb")
+            row(.silent, "Silent (quiet hours)", save: "Save Silent")
+            Text("Silent “Always” is the same as Mute sounds above. Timers and alarms may still sound while muted. For quiet nights with the seconds visible, turn Do Not Disturb off and schedule Silent for the same hours.").note()
+        }
+        .onAppear(perform: sync).onChange(of: clock.settings) { _, _ in sync() }
+    }
+    private func current(_ kind: ClockSchedule.Kind) -> ClockSchedule { draft[kind] ?? clock.settings?.schedule(kind) ?? ClockSchedule() }
+    private func bind(_ kind: ClockSchedule.Kind, _ path: WritableKeyPath<ClockSchedule, Int>) -> Binding<Int> {
+        Binding(get: { current(kind)[keyPath: path] },
+                set: { var d = current(kind); d[keyPath: path] = $0; draft[kind] = d; dirty.insert(kind) })
+    }
+    private func hours(_ value: Binding<Int>) -> some View {
+        Picker("", selection: value) { ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) } }.labelsHidden().frame(width: 90)
+    }
+    @ViewBuilder private func row(_ kind: ClockSchedule.Kind, _ title: String, save: String) -> some View {
+        let read = clock.settings?.schedule(kind)
+        let editable = clock.canControl && (read?.known ?? false)
+        let d = current(kind)
+        Text(title).font(.system(size: 14, weight: .semibold)).padding(.top, 4)
+        HStack(spacing: 8) {
+            Picker("", selection: bind(kind, \.mode)) { Text("Off").tag(0); Text("Scheduled").tag(1); Text("Always").tag(2) }.labelsHidden().frame(width: 130)
+            if d.mode == 1 { Text("from"); hours(bind(kind, \.from)); Text("to"); hours(bind(kind, \.till)) }
+            Spacer()
+        }.disabled(!editable)
+        HStack(spacing: 10) {
+            Button(save) { dirty.remove(kind); clock.setSchedule(kind, mode: d.mode, from: d.from, till: d.till) }
+                .og(.secondary).disabled(!editable || (d.mode == 1 && d.from == d.till))
+            Text(d.mode == 1 && d.from == d.till ? "Start and end hours must differ." : "Read from clock: \(read?.summary ?? "not read yet")").note()
+        }
+    }
+    private func sync() {
+        for kind in ClockSchedule.Kind.allCases where !dirty.contains(kind) { draft[kind] = clock.settings?.schedule(kind) }
+    }
+}
+
+// MARK: Seconds pixel
+
+struct SecondsCard: View {
+    @ObservedObject var clock: BluetoothController
+    @ObservedObject var seconds: SecondsService
+    private var ledCount: Int { (0..<4).filter { seconds.rings >> $0 & 1 != 0 }.count }
+    var body: some View {
+        Card(title: "Seconds pixel") {
+            SwitchRow(title: "Show a ticking seconds pixel", detail: "Runs while this app is open and connected", isOn: seconds.on) {
+                seconds.apply(on: $0, color: seconds.color, rings: seconds.rings)
+            }
+            HStack(alignment: .top, spacing: 18) {
+                SecondsPreview(color: SecondsScene.colours.first { $0.id == seconds.color }?.rgb ?? 0x40E0D0, rings: seconds.rings)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Picker("Colour", selection: Binding(get: { seconds.color }, set: { seconds.apply(on: seconds.on, color: $0, rings: seconds.rings) })) {
+                            ForEach(SecondsScene.colours, id: \.id) { Text($0.name).tag($0.id) }
+                        }.frame(maxWidth: 230)
+                        Circle().fill(Color(hex: SecondsScene.colours.first { $0.id == seconds.color }?.rgb ?? 0x40E0D0)).frame(width: 14, height: 14)
+                    }
+                    Text("LEDs that light").note()
+                    HStack(spacing: 6) {
+                        Text("Outer").note()
+                        ForEach(0..<4, id: \.self) { bit in
+                            let lit = seconds.rings >> bit & 1 != 0
+                            Button { seconds.apply(on: seconds.on, color: seconds.color, rings: seconds.rings ^ (1 << bit)) } label: {
+                                Text("\(bit + 1)").font(.system(size: 13, weight: .semibold)).frame(width: 30, height: 30)
+                                    .foregroundStyle(lit ? Color.white : Theme.muted)
+                                    .background(Circle().fill(lit ? Theme.teal : Theme.bg)).overlay(Circle().stroke(Theme.line))
+                            }.buttonStyle(.plain).disabled(lit && ledCount == 1)
+                                .help(lit && ledCount == 1 ? "Keep at least one LED lit" : bit == 0 ? "Outer ring" : bit == 3 ? "Nearest the centre" : "Ring \(bit + 1)")
+                        }
+                        Text("Centre").note()
+                    }
+                    Text("\(ledCount) LED\(ledCount == 1 ? "" : "s") · new clock scene about every \(SecondsScene.sceneSteps[seconds.rings] == 8 ? "10 s" : "7.5 s (a gap between lit LEDs needs two segments per step)")").note()
+                    Text("One lap per minute · one step every 1.25 s · illustrative preview").note()
+                }
+            }
+            HStack {
+                Text(seconds.status).font(.system(size: 14, weight: .semibold))
+                if seconds.failed { Button("Retry") { seconds.retry() }.og(.secondary) }
+            }
+            Text("Clock Do Not Disturb: \(clock.handState == nil ? "not read" : clock.doNotDisturbActive ? "active" : "inactive"). Automatic night mode is a separate setting.").note()
+            Text("Pauses for Do Not Disturb, timers, alarms, chimes and calibration; messages get a 90-second pause. Uses the weather ring's slot; weather comes back when seconds are off. The clock redraws each new scene, so expect a small blip and a time/date switch about every 10 s.").note()
+        }
+    }
+}
+
+struct SecondsPreview: View {
+    let color: UInt32
+    let rings: Int
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            Canvas { g, size in
+                let t = context.date.timeIntervalSince1970
+                let head = SecondsScene.pixelAt(frame: Int(t.truncatingRemainder(dividingBy: 60) * Double(SecondsScene.fps)))
+                let scale = min(size.width, size.height) / 160
+                for (ring, r) in [64.0, 56, 48, 40].enumerated() {
+                    for i in 0..<48 {
+                        let a = Double(i) * .pi / 24 - .pi / 2
+                        let lit = i == head && rings >> ring & 1 != 0
+                        let c = CGPoint(x: (80 + r * cos(a)) * scale, y: (80 + r * sin(a)) * scale)
+                        g.fill(Path(ellipseIn: CGRect(x: c.x - 2.6 * scale, y: c.y - 2.6 * scale, width: 5.2 * scale, height: 5.2 * scale)),
+                               with: .color(lit ? Color(hex: color) : Theme.muted.opacity(0.25)))
+                    }
+                }
+            }
+        }
+        .frame(width: 150, height: 150)
+        .background(Circle().fill(Color(light: 0x1C2328, dark: 0x11171B)))
+    }
+}
+
 // MARK: Clock (pairing, connection, calibration)
 
 struct ClockTab: View {
+    let model: AppModel
     @ObservedObject var clock: BluetoothController
     @ViewState private var confirmForget = false
     @ViewState private var confirmStart = false
@@ -618,7 +764,7 @@ struct ClockTab: View {
             if !clock.isConnected && !clock.demoMode { Button("Explore demo (no Bluetooth)") { clock.setDemo(true) }.buttonStyle(.plain).foregroundStyle(Theme.tealInk) }
             if clock.demoMode { Button("Exit demo") { clock.setDemo(false) }.og(.secondary) }
         }
-        .confirmationDialog("Forget the saved clock?", isPresented: $confirmForget) { Button("Forget", role: .destructive) { clock.forgetClock() } }
+        .confirmationDialog("Forget the saved clock?", isPresented: $confirmForget) { Button("Forget", role: .destructive) { model.disconnect(forget: true) } }
         ClockTimeCard(clock: clock)
         Card(title: "Connection") {
             SwitchRow(title: "Connect to the saved clock automatically", detail: "Turn off while the OpenGlance Bridge is in use; the clock accepts one connection at a time.", isOn: clock.autoConnect) { clock.autoConnect = $0 }
@@ -798,7 +944,7 @@ enum Screenshot {
         let args = CommandLine.arguments
         guard let i = args.firstIndex(of: "--screenshot"), i + 1 < args.count else { return false }
         let tabName = args.firstIndex(of: "--tab").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "home"
-        let tab = Tab.allCases.first { $0.rawValue.lowercased() == tabName.lowercased() } ?? .home
+        let tab = tabName.lowercased() == "messages" ? .alerts : Tab.allCases.first { $0.rawValue.lowercased() == tabName.lowercased() } ?? .home
         let height = args.firstIndex(of: "--height").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil } ?? 820
         model.clock.setDemo(true)
         var f = HourlyForecast()
@@ -810,7 +956,8 @@ enum Screenshot {
         f.current = 17
         model.weather.loadDemo(f)
         if model.weather.place == nil { model.weather.place = .init(name: "Canberra, Australian Capital Territory, Australia", latitude: -35.28, longitude: 149.13) }
-        let view = RootView(model: model, clock: model.clock, alarms: model.alarms, chime: model.chime, weather: model.weather, tab: tab)
+        if args.contains("--seconds") { model.seconds.apply(on: true, color: 18, rings: 3) }
+        let view = RootView(model: model, clock: model.clock, alarms: model.alarms, chime: model.chime, weather: model.weather, seconds: model.seconds, tab: tab)
             .frame(width: 1100, height: height)
         let host = NSHostingView(rootView: view)
         host.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)

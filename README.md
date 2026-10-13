@@ -7,7 +7,7 @@
   &nbsp;
   <img src="docs/images/clock-announcement.jpg" width="320" alt="The clock face showing 'OpenGl…' scrolling across the display with the green Fire animation on the ring">
 </p>
-<p align="center"><em>After start-up the bridge connects to the clock and announces itself: “OpenGlance 1.10 connected”.</em></p>
+<p align="center"><em>After start-up the bridge connects to the clock and announces itself with its version (here “OpenGlance 1.10 connected”).</em></p>
 
 ---
 
@@ -31,35 +31,36 @@ The Glance Clock only speaks Bluetooth LE. The bridge is an ESP32-C3 that sits *
 - **A clock that is permanently online.** It gets internet time and weather automatically, with nothing else needing to be switched on.
 - **Exact time, all the time.** The bridge takes time from NTP and hands it to the clock through the standard Bluetooth *Current Time Service*, which the clock reads every time it connects. It re-syncs daily at 03:05 and whenever daylight saving starts or ends. Time zones are POSIX rules, so DST switches automatically.
 
-<p align="center"><img src="docs/images/bridge-home.png" width="820" alt="Bridge web page, Home tab: clock connected, battery 100%, internet time, weather 12°C in Canberra, recent activity"></p>
+<p align="center"><img src="docs/images/bridge-home.png" width="820" alt="Bridge web page 1.22, Home tab: internet time with a manual-time option, the clock connected with battery 100% and the time it last read, time zone, weather, recent activity"></p>
 
 ### Features
 
 | Tab | What you can do |
 | --- | --- |
-| **Home** | Connection, battery, the time last read by the clock and the exact value supplied, weather summary, **Sync time now**, recent activity |
-| **Messages** | Send scrolling text with an animation (Pulse, Wave, Fire, Wheel, Flower, Sun, Cloud), a colour and any of the 17 built-in sounds (each with **Test**). Start/stop timers. **Hourly chime** with your choice of sound and quiet hours |
+| **Home** | Bridge time (internet or manual, with a clear switch back to internet time), **Update clock now**, time zone and daily correction, the clock's connection and battery, the time it last read and the exact value supplied, weather summary, recent activity |
+| **Alerts** | Send scrolling text with an animation (Pulse, Wave, Fire, Wheel, Flower, Sun, Cloud), a colour and any of the 17 built-in sounds (each with **Test**). Start/stop timers. **Bridge hourly chime** with your choice of sound and quiet hours, and the **clock's own built-in hourly chime** (Off or a sound) |
 | **Alarms** | Up to 4 alarms with days (Weekdays, Weekend, Every day, Once or any mix), sound and a 16-character label. **Stop the alarm now**, **Delete all alarms on the clock** |
 | **Weather** | A 24-hour **temperature ring** coloured blue → green → amber → red, and a **rain ring** shown only when rain is really coming (amount *and* chance within a look-ahead you choose). Alternates the two rings on an interval, or shows rain instead. Place search, 12-hour preview. Data from [Open-Meteo](https://open-meteo.com) |
-| **Display** | Digital time, 12/24-hour, hour points, night mode, mute, date format, and brightness: **automatic with minimum/maximum limits**, or fixed |
-| **Clock** | Find and pair a clock (type the PIN it shows), automatic reconnection, the optional silent “OpenGlance connected” message, and **hand calibration** with a reseating guide |
-| **System** | Time zone and manual time, Wi-Fi, **firmware update over Wi-Fi** (files are checked before installing), full activity log |
+| **Display** | Digital time, 12/24-hour, hour points, night mode, mute, date format, brightness (**automatic with minimum/maximum limits**, or fixed), **Night settings** (the clock's Do Not Disturb and Silent schedules) and the **seconds pixel** |
+| **Clock** | Find and pair a clock (type the PIN it shows) and **hand calibration** with a reseating guide |
+| **System** | Connection options (automatic reconnection, the optional silent “OpenGlance connected” message), Wi-Fi, **firmware update over Wi-Fi** (files are checked before installing), full activity log |
+
+### Seconds pixel and night settings
+
+- **Seconds pixel:** a single LED ticks once round the ring every minute, in any of the clock's 24 colours. Click which of the four LEDs from the outer ring to the centre should light (one dot, a short radial line, or any mix). The clock draws the movement itself from scenes of about 10 seconds that the bridge sends, so it uses very little Bluetooth. The stock clock firmware restarts a scene each time it is replaced, so expect a small blip, and the time/date switch, about every 10 seconds. It shares the weather ring's slot: weather pauses while it is on. It pauses for timers, alarms, chimes, messages and calibration.
+- **Night settings:** the clock's own **Do Not Disturb** hides ring overlays (including the seconds and weather) and notifications. **Silent** only mutes sounds. Choose Off, Scheduled (from–to) or Always for each. For quiet nights with the seconds still ticking, turn Do Not Disturb off and schedule Silent instead. Every change is read back from the clock to confirm it.
 
 <table>
 <tr>
-<td><img src="docs/images/bridge-message.png" alt="Messages tab"></td>
-<td><img src="docs/images/bridge-alarms.png" alt="Alarms tab"></td>
-</tr>
-<tr>
-<td><img src="docs/images/bridge-display.png" alt="Display tab with brightness range"></td>
-<td><img src="docs/images/bridge-clock.png" alt="Clock tab: pairing, connection and hand calibration"></td>
+<td><img src="docs/images/bridge-alerts.png" alt="Alerts tab: message, bridge hourly chime, the clock's built-in hourly chime and timer"></td>
+<td><img src="docs/images/bridge-display.png" alt="Display tab: display settings, brightness range, night settings and the seconds pixel with its LED picker"></td>
 </tr>
 </table>
 
 <table>
 <tr>
 <td width="68%"><img src="docs/images/bridge-weather.png" alt="Weather tab: rain rule, 12-hour temperature and rain preview for Canberra, colour range"></td>
-<td><img src="docs/images/bridge-phone-dark.png" alt="The bridge page on a phone in dark mode"><br><em>Works on a phone too, in light or dark mode.</em></td>
+<td><img src="docs/images/bridge-phone-dark.png" alt="Night settings and the seconds pixel on a phone in dark mode"><br><em>Works on a phone too, in light or dark mode.</em></td>
 </tr>
 </table>
 
@@ -108,7 +109,7 @@ That's all. The bridge does **not** connect to any of the clock's logic; it only
 
 ## 2. OpenGlance Clock (Mac and Windows app)
 
-For a Glance Clock **without** the bridge. The app connects straight to the clock over your computer's Bluetooth and has the same look and features as the bridge's web page: messages and sounds, timers, hourly chime, alarms, weather rings, display and brightness settings, pairing, auto-connect and hand calibration.
+For a Glance Clock **without** the bridge. The app connects straight to the clock over your computer's Bluetooth and has the same look and features as the bridge's web page: alerts, sounds and timers, hourly chimes, alarms, weather rings, display and brightness settings, **night settings**, the **seconds pixel**, pairing, auto-connect and hand calibration. Things that need the app to be running (the seconds pixel, weather, the app's hourly chime) work while it is open; Disconnect and Quit tidy the ring first.
 
 <p align="center"><img src="docs/images/mac-clock-home.png" width="820" alt="OpenGlance Clock for Mac, Home tab"></p>
 
@@ -123,8 +124,8 @@ A computer can't set the clock's time the way the bridge does. macOS doesn't let
 
 <table>
 <tr>
-<td width="55%"><img src="docs/images/mac-clock-time-dark.png" alt="Mac app, Clock tab in dark mode: Clock time card with Set, fine adjust and calibration"></td>
-<td><img src="docs/images/mac-clock-weather.png" alt="Mac app, Weather tab with 12-hour preview"></td>
+<td width="50%"><img src="docs/images/mac-clock-time.png" alt="Mac app, Clock tab: Clock time card with Set, fine adjust and calibration"></td>
+<td><img src="docs/images/mac-clock-display.png" alt="Mac app, Display tab: night settings and the seconds pixel"></td>
 </tr>
 </table>
 
@@ -134,14 +135,14 @@ The Windows version is a native rewrite with the same tabs and features, deliver
 
 <table>
 <tr>
-<td><img src="docs/images/windows-clock-messages.png" alt="Windows app, Messages tab"></td>
+<td><img src="docs/images/windows-clock-alerts.png" alt="Windows app, Alerts tab"></td>
 </tr>
 <tr>
-<td><img src="docs/images/windows-clock-alarms-dark.png" alt="Windows app, Alarms tab in dark mode"></td>
+<td><img src="docs/images/windows-clock-display-dark.png" alt="Windows app in dark mode: night settings and the seconds pixel"></td>
 </tr>
 </table>
 
-> **Status:** the Mac app has been tested on a real clock, including setting the time. The Windows app is a first build and has **not yet been tested with a real clock**. It needs a PC with Bluetooth LE; virtual machines (e.g. Parallels on Apple silicon) usually don't provide one.
+> **Status:** the Mac app has been tested on a real clock, including setting the time. The night settings and seconds pixel are new in 0.33 and match the bridge byte for byte, but have not yet been run from the desktop apps on a real clock. The Windows app has **not yet been tested with a real clock**. It needs a PC with Bluetooth LE; virtual machines (e.g. Parallels on Apple silicon) usually don't provide one.
 
 ---
 
@@ -208,7 +209,7 @@ The Glance Clock's Bluetooth protocol was documented by others first. This proje
 - [PorlyBe/glance_clock_ha](https://github.com/PorlyBe/glance_clock_ha) and [Snille/glance_clock_ha](https://github.com/Snille/glance_clock_ha): Home Assistant integrations, including hardware-tested forecast scenes and brightness handling
 - [PorlyBe/bluetooth-cts](https://github.com/PorlyBe/bluetooth-cts): the clock reads time from a Current Time Service on the connected device
 
-New in OpenGlance, from static analysis of the original app and the clock's firmware: the automatic-brightness minimum/maximum encoding, the alarm list format, the hand-calibration state flags, and the hidden time-offset setting that lets a Mac set the time.
+New in OpenGlance, from static analysis of the original app and the clock's firmware: the automatic-brightness minimum/maximum encoding, the alarm list format, the hand-calibration state flags, the hidden time-offset setting that lets a Mac set the time, how the firmware evaluates its Do Not Disturb and Silent schedules, and why a replaced ring scene restarts (each scene is re-initialised and must fit one Bluetooth write, which shapes the seconds pixel).
 
 Settings are always read from the clock first, unknown fields are preserved, and every change is read back to confirm it. Nothing here flashes or alters the clock's own firmware.
 

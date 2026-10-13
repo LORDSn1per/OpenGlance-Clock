@@ -9,6 +9,10 @@ Each is one self-contained 64-bit `.exe`. Nothing needs installing: no .NET runt
 
 ## Using OpenGlance Clock
 
+Version 0.33 matches the Mac app 0.33: **Display → Night settings** (the clock's Do Not Disturb and Silent schedules, read back after each save), **Display → Seconds pixel** (single ticking pixel, 24 colours, choice of the 4 radial LEDs; runs while the app is open and connected, pauses for DND/timers/alarms/calibration, shares the weather slot), and **Messages renamed Alerts**. Scenes and schedule writes are byte-identical to bridge 1.22. Not yet run on Windows hardware.
+
+Version 0.32 adds **Messages → Clock’s built-in hourly chime**, separate from the app chime. Choose **Off** to write field 15=0 without muting alarms, timers or messages, or select a sound. The current clock-read value is shown and every edit is read back. App quiet hours do not control it. Unrelated settings and time offset 18 are preserved. Native silencing/persistence are not hardware-tested yet.
+
 1. Requires Windows 10 version 2004 or later and Bluetooth LE.
 2. Quit the bridge or phone app if either is connected to the clock (the clock accepts one connection).
 3. Short-press the clock's button to activate pairing mode (do not hold it).
@@ -33,7 +37,7 @@ bash build.sh
 
 - Needs the .NET 8 SDK (`brew install dotnet@8`) and internet access on first use (NuGet packages; esptool download, checksum-verified and cached in `~/Library/Caches/OpenGlance`).
 - Version numbers come from the newest `MAC/OpenGlance Clock X.YY.app` and `MAC/OpenGlance Flasher X.YY.app`: **bump the Mac app first, then run this script**, so Mac and Windows always share a number. Existing `.exe` files are never overwritten.
-- Runs `ProtocolChecks` (12 groups) and `FlasherChecks` (5 groups, including every real OTA.bin) before publishing.
+- Runs `ProtocolChecks` (13 groups) and `FlasherChecks` (5 groups, including every real OTA.bin) before publishing.
 - `set-version-info.py` writes the Windows version details (Explorer → Properties), which the .NET SDK only does when building on Windows.
 
 ## Layout

@@ -29,6 +29,14 @@ public sealed class ClockController
     public bool NeedsCalibrationConfirmation { get; private set; }
     public bool IsCalibrating { get; private set; }
     public string HandStatus { get; private set; } = "Hand position not read";
+    /// Latest hand/state flags (5075fc78) and when they were read or notified.
+    public ClockHandState? HandState { get; private set; }
+    public DateTime? HandStateUpdated { get; private set; }
+    public bool DoNotDisturbActive => HandState?.DoNotDisturb ?? false;
+    /// Called before a command that takes over the display (message, timer, calibration…), with the
+    /// seconds of quiet it needs, so the seconds pixel can step aside first (as the bridge does).
+    public List<Action<double>> OnDisplayCommand { get; } = new();
+    public void AnnounceDisplayCommand(double quiet) { foreach (var a in OnDisplayCommand.ToArray()) a(quiet); }
     public string? RememberedName => Store.State.ClockName;
     public bool HasRememberedClock => Store.State.ClockAddress is not null;
     public bool BluetoothAvailable => radio is not null;
@@ -102,7 +110,7 @@ public sealed class ClockController
         if (enabled)
         {
             ClockName = "Studio clock";
-            Settings = new ClockSettings(new byte[] { 16, 1, 32, 0, 40, 1, 72, 1, 80, 128, 1, 88, 1, 96, 0 });
+            Settings = new ClockSettings(new byte[] { 16, 1, 32, 0, 40, 1, 72, 1, 80, 128, 1, 88, 1, 96, 0, 10, 6, 8, 1, 16, 22, 24, 7 });   // DND 22–07
             Battery = 84; FirmwareVersion = "1.6.7";
             Status = "Demo mode · no Bluetooth commands";
             Log("Demo mode", "Try the controls. No clock is connected and no Bluetooth commands are sent.");
@@ -208,6 +216,7 @@ public sealed class ClockController
         var old = link; link = null;
         IsConnecting = false; IsConnected = false; Settings = null; Battery = null; FirmwareVersion = null; IsBusy = false;
         NeedsCalibrationConfirmation = false; IsCalibrating = false; HandStatus = "Hand position not read";
+        HandState = null; HandStateUpdated = null;
         try { old?.Dispose(); } catch { }
         if (!DemoMode) Status = "Disconnected";
         Notify();
@@ -292,6 +301,50 @@ public sealed class ClockController
         finally { IsBusy = false; Notify(); }
     }
 
+    /// Writes one night schedule (Do Not Disturb or Silent): fresh read, replace only that schedule and its
+    /// permanent flag, write, read back and verify. Same bytes as the bridge's /api/night.
+    public async void SetSchedule(ScheduleKind kind, int mode, int from, int till)
+    {
+        if (!CanControl) return;
+        var name = kind == ScheduleKind.DoNotDisturb ? "Do Not Disturb" : "Silent hours";
+        var what = name + ": " + (mode == 0 ? "off" : mode == 2 ? "always on" : $"{from:00}:00–{till:00}:00");
+        if (!ClockSchedule.IsValid(mode, from, till)) { Fail("Choose Off, Scheduled or Always, and different start and end hours."); return; }
+        if (DemoMode)
+        {
+            try { if (Settings is not null) Settings = new ClockSettings(Settings.PatchedSchedule(kind, mode, from, till)[4..]); Log("Demo · " + what.ToLowerInvariant(), "No Bluetooth command was sent."); }
+            catch (Exception e) { Fail(e.Message); }
+            Notify(); return;
+        }
+        IsBusy = true; Notify();
+        try
+        {
+            byte[] command;
+            try { command = (await ReadSettings()).PatchedSchedule(kind, mode, from, till); }
+            catch (ProtocolException) { Fail($"This clock's {name} schedule could not be read, so it was not changed."); return; }
+            await Write(command);
+            var updated = await ReadSettings();
+            Settings = updated;
+            if (updated.MatchesSchedule(kind, mode, from, till)) Log(what, "Confirmed by the clock.");
+            else Fail($"{what}: the write was accepted, but the clock did not return the requested schedule.");
+        }
+        catch (Exception e) { Fail(e.Message); }
+        finally { IsBusy = false; Notify(); }
+        ReadHandState();   // the DND state bit changes immediately
+    }
+    /// Read-only refresh of the state flags (used by the seconds pixel to keep DND/calibration fresh).
+    public async void ReadHandState()
+    {
+        if (DemoMode || link is null) return;
+        try { if (await Op(l => l.ReadStateAsync()) is byte[] b) UpdateHandState(b); } catch { }
+    }
+    public bool CanReadFace => link?.CanReadScene ?? false;
+    /// The clock's active face (5075ffac); null when unavailable or unreadable.
+    public async Task<int?> ReadFace()
+    {
+        try { return await Op(l => l.ReadSceneAsync()) is byte[] b && b.Length == 1 ? b[0] : null; }
+        catch { return null; }
+    }
+
     /// Moves the clock's running time by `minutes` via Settings field 18 (see ClockTimeCorrection).
     /// `clockMinusNow`: the clock's reading relative to this PC once the change lands, when known
     /// (the owner typed the clock's reading); it re-learns the estimate baseline.
@@ -337,36 +390,40 @@ public sealed class ClockController
 
     public void SendMessage(string text, int animation, int sound, int color)
     {
-        try { Send(GlanceCommands.Notice(text, animation, sound, color), "Message sent", $"{text} · Bluetooth acknowledged; check the clock display."); }
+        try { var packet = GlanceCommands.Notice(text, animation, sound, color); AnnounceDisplayCommand(90); Send(packet, "Message sent", $"{text} · Bluetooth acknowledged; check the clock display."); }
         catch (ProtocolException e) { Fail(e.Message); }
     }
     public void StartTimer(int minutes)
     {
-        try { Send(GlanceCommands.Timer(minutes * 60), "Timer sent", $"{minutes} minutes · the countdown here is an estimate.", () => TimerEnd = DateTime.Now.AddMinutes(minutes)); }
+        try { var packet = GlanceCommands.Timer(minutes * 60); AnnounceDisplayCommand(0); Send(packet, "Timer sent", $"{minutes} minutes · the countdown here is an estimate.", () => TimerEnd = DateTime.Now.AddMinutes(minutes)); }
         catch (ProtocolException e) { Fail(e.Message); }
     }
-    public void StopTimer() => Send(GlanceCommands.StopTimer, "Timer stop sent", "", () => TimerEnd = null);
+    public void StopTimer() { AnnounceDisplayCommand(2); Send(GlanceCommands.StopTimer, "Timer stop sent", "", () => TimerEnd = null); }
     public void StartCalibration()
     {
         if (IsCalibrating) { Fail("Calibration is already moving the hands. Wait for the clock to stop."); return; }
+        AnnounceDisplayCommand(0);
         Send(GlanceCommands.StartCalibration, "Calibration started", "Wait for the hands to finish moving. Confirm only when both hands point to 12.", () => NeedsCalibrationConfirmation = true);
     }
     public void ConfirmCalibration()
     {
         if (IsCalibrating) { Fail("Wait until the hands stop before confirming calibration."); return; }
+        AnnounceDisplayCommand(10);
         Send(GlanceCommands.ConfirmCalibration, "Hand position confirmed", "", () => NeedsCalibrationConfirmation = false);
     }
     public void TestSound(int sound)
     {
+        AnnounceDisplayCommand(90);
         try { Send(GlanceCommands.Notice("Sound test", 0, sound, 12), "Sound test sent", Settings?.Muted == true ? "Mute is on, so the clock may stay silent." : Glance.Sounds[sound]); }
         catch (ProtocolException e) { Fail(e.Message); }
     }
-    public void StopAlarm() => Send(GlanceCommands.AlarmStop, "Alarm stop sent");
+    public void StopAlarm() { AnnounceDisplayCommand(2); Send(GlanceCommands.AlarmStop, "Alarm stop sent"); }
 
     void UpdateHandState(byte[] data)
     {
         ClockHandState state;
         try { state = new ClockHandState(data); } catch { HandStatus = "Clock hand-state format not recognised"; Notify(); return; }
+        HandState = state; HandStateUpdated = DateTime.Now;
         IsCalibrating = state.Homing;
         NeedsCalibrationConfirmation = state.AwaitingConfirmation;
         var next = state.MotorFailure ? "Clock reports a motor failure" : state.HomingFailure ? "Clock reports a homing failure"
@@ -376,16 +433,16 @@ public sealed class ClockController
         Notify();
     }
 
-    /// Background send (chime, weather, alarms): never shows a dialog and never retries.
+    /// Background send (chime, weather, alarms, seconds): never shows a dialog and never retries.
+    /// It does not mark the app busy, so frequent seconds scenes never grey out the controls; the
+    /// operation gate still runs every read and write one at a time.
     public async void SendQuietly(byte[] data, string title, bool logSuccess = true, Action<bool>? completion = null)
     {
         if (DemoMode) { if (logSuccess) Log("Demo · " + title.ToLowerInvariant(), "No Bluetooth command was sent."); completion?.Invoke(true); return; }
-        if (!IsConnected || Settings is null || IsBusy) { completion?.Invoke(false); return; }
-        IsBusy = true; Notify();
+        if (!IsConnected || Settings is null) { completion?.Invoke(false); return; }
         bool ok;
         try { await Write(data); ok = true; if (logSuccess) Log(title); }
         catch (Exception e) { ok = false; Log(title + " failed", e.Message, error: true); }
-        IsBusy = false; Notify();
         completion?.Invoke(ok);
     }
 

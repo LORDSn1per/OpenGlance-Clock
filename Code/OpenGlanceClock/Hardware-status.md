@@ -1,5 +1,9 @@
 # Owner-reported hardware status
 
+## Latest chime change — 13 October 2026
+
+Bridge 1.11 and Mac/Windows 0.32 add the separate native hourly sound (Settings field 15, `charmSound`, None/Off=0). Original APK confirms its `hourlySound` UI mapping. Builds/checks and simulated controls pass, but **the owner chose to leave files ready**. Nothing was installed or written to the clock; actual bridge remains 1.10 and connected, with its own chime Off. Native sound value, silencing and power-cycle persistence remain unverified. Do not claim the physical chime fixed until installation and an owner test.
+
 Updated 13 October 2026. These are the owner's observations, not automated hardware tests.
 
 | Feature | Result |
@@ -63,3 +67,10 @@ Not yet tested on the clock. Found by static disassembly of firmware 1.6.7: chan
 ## Windows apps (13 October 2026)
 
 `Windows/OpenGlance Clock 0.31.exe` and `Windows/OpenGlance Flasher 1.01.exe` were built on the Mac and have **not been run on Windows**. Pairing, PIN entry, every clock control, the field-18 time setting, flashing and boot-banner confirmation on Windows all await the owner's test.
+
+## Bridge 1.20–1.22 and desktop 0.33 (14 October 2026)
+
+- Owner-confirmed on bridge 1.20: a single seconds pixel ticks, with a blip every ~10 s that coincides with the time/date switch (stock firmware re-initialises a replaced scene).
+- Owner-confirmed on bridge 1.17: the clock hides ring overlays during its own Do Not Disturb, so the seconds cannot show then.
+- Not yet tested: bridge 1.21 LED choice on the physical rings; bridge 1.22 / desktop 0.33 night-setting writes; the seconds pixel driven from Mac/Windows 0.33.
+

@@ -21,6 +21,17 @@ public struct WireMessage {
         public let wireType: Int
         public let encoded: Data
         public let integer: UInt64?
+        /// Length-delimited contents (wire type 2), without key and length.
+        public var payload: Data? {
+            guard wireType == 2 else { return nil }
+            let b = Array(encoded)
+            var i = 0
+            while i < b.count && b[i] & 0x80 != 0 { i += 1 }   // key
+            i += 1
+            while i < b.count && b[i] & 0x80 != 0 { i += 1 }   // length
+            i += 1
+            return i <= b.count ? Data(b[i...]) : nil
+        }
     }
     public let fields: [Field]
 
@@ -119,9 +130,13 @@ public struct ClockSettings: Equatable {
     public let hourPoints: Bool
     public let muted: Bool
     public let dateFormat: Int
+    public let builtInChimeSound: UInt64
     /// Settings field 18 (int32 minutes, firmware 1.6.7+). See ClockTimeCorrection.
     public let timeOffsetMinutes: Int
-    public static let editableFields: Set<Int> = [2, 4, 5, 9, 10, 11, 12]
+    /// Do Not Disturb (field 1 + permanentDND 3) and Silent (field 14 + permanentMute 4); see ClockSchedule.
+    public let doNotDisturb: ClockSchedule
+    public let silent: ClockSchedule
+    public static let editableFields: Set<Int> = [2, 4, 5, 9, 10, 11, 12, 15]
     public static let timeOffsetField = 18
 
     public init(data: Data) throws {
@@ -135,6 +150,7 @@ public struct ClockSettings: Equatable {
             guard field.wireType == 0, let value = field.integer, value <= 1 else { throw ProtocolError.invalidSettings }
         }
         guard (message.integer(5) ?? 0) <= 4 else { throw ProtocolError.invalidSettings }
+        guard message.fields.filter({ $0.number == 15 }).allSatisfy({ $0.wireType == 0 }) else { throw ProtocolError.invalidSettings }
         raw = payload
         brightness = Int((message.integer(10) ?? 0) & 255)
         automaticBrightnessLow = Int(((message.integer(10) ?? 0) >> 16) & 255)
@@ -145,7 +161,36 @@ public struct ClockSettings: Equatable {
         hourPoints = (message.integer(9) ?? 0) != 0
         muted = (message.integer(4) ?? 0) != 0
         dateFormat = Int(message.integer(5) ?? 0)
+        builtInChimeSound = message.integer(15) ?? 0
         timeOffsetMinutes = message.integer(Self.timeOffsetField).map { Int(Int32(truncatingIfNeeded: $0)) } ?? 0
+        doNotDisturb = ClockSchedule.read(message, kind: .doNotDisturb)
+        silent = ClockSchedule.read(message, kind: .silent)
+    }
+
+    public func schedule(_ kind: ClockSchedule.Kind) -> ClockSchedule { kind == .doNotDisturb ? doNotDisturb : silent }
+
+    /// Replaces only one schedule sub-message (all three required sub-fields) and its permanent flag;
+    /// every other field, known or unknown, is resent byte for byte. Same bytes as bridge patchSchedule.
+    public func patched(schedule kind: ClockSchedule.Kind, mode: Int, from: Int, till: Int) throws -> Data {
+        guard ClockSchedule.isValid(mode: mode, from: from, till: till), schedule(kind).known else { throw ProtocolError.invalidSettings }
+        let message = try WireMessage(raw)
+        let inner = WireMessage.integer(1, mode == 1 ? 1 : 0) + WireMessage.integer(2, UInt64(from)) + WireMessage.integer(3, UInt64(till))
+        let flag = kind.permanentField
+        var body = Data(), wroteSchedule = false, wroteFlag = false
+        for field in message.fields {
+            if field.number == kind.rawValue {
+                if !wroteSchedule { body += WireMessage.bytes(kind.rawValue, inner); wroteSchedule = true }
+            } else if field.number == flag {
+                if !wroteFlag { body += WireMessage.integer(flag, mode == 2 ? 1 : 0); wroteFlag = true }
+            } else { body += field.encoded }
+        }
+        if !wroteSchedule { body += WireMessage.bytes(kind.rawValue, inner) }
+        if !wroteFlag { body += WireMessage.integer(flag, mode == 2 ? 1 : 0) }
+        return Data([5, 0, 0, 0]) + body
+    }
+    public func matches(schedule kind: ClockSchedule.Kind, mode: Int, from: Int, till: Int) -> Bool {
+        let x = schedule(kind)
+        return x.known && x.mode == mode && x.from == from && x.till == till
     }
 
     /// Replaces only field 18; every other field, known or unknown, is resent unchanged.
@@ -162,6 +207,7 @@ public struct ClockSettings: Equatable {
         for (field, value) in changes {
             if field == 10 { guard value <= 255 else { throw ProtocolError.invalidSettings } }
             else if field == 5 { guard value <= 4 else { throw ProtocolError.invalidSettings } }
+            else if field == 15 { guard value <= 17 else { throw ProtocolError.invalidSettings } }
             else { guard value <= 1 else { throw ProtocolError.invalidSettings } }
         }
         let message = try WireMessage(raw)
@@ -182,6 +228,44 @@ public struct ClockSettings: Equatable {
             let actual = message.integer($0.key) ?? 0
             return ($0.key == 10 ? actual & 255 : actual) == $0.value
         }
+    }
+}
+
+/// The clock's own night schedules (firmware 1.6.7 evaluators 0x1F982 DND and 0x1FA02 Silent):
+/// the permanent flag means always; otherwise `recurring` means from ≤ hour < till (wrapping past
+/// midnight when till < from); recurring false is off. Do Not Disturb hides ring overlays (seconds,
+/// weather) and notifications; Silent only mutes sounds, and Silent "Always" is the Mute sounds flag.
+public struct ClockSchedule: Equatable {
+    public enum Kind: Int, CaseIterable {
+        case doNotDisturb = 1, silent = 14
+        public var permanentField: Int { self == .doNotDisturb ? 3 : 4 }
+    }
+    public var known = true
+    public var mode = 0          // 0 Off, 1 Scheduled, 2 Always
+    public var from = 22, till = 8
+    public init(known: Bool = true, mode: Int = 0, from: Int = 22, till: Int = 8) {
+        self.known = known; self.mode = mode; self.from = from; self.till = till
+    }
+    public static func isValid(mode: Int, from: Int, till: Int) -> Bool {
+        (0...2).contains(mode) && (0...23).contains(from) && (0...23).contains(till) && (mode != 1 || from != till)
+    }
+    static func read(_ message: WireMessage, kind: Kind) -> ClockSchedule {
+        var out = ClockSchedule()
+        let always = (message.integer(kind.permanentField) ?? 0) != 0
+        var recurring = false, malformed = false
+        for field in message.fields where field.number == kind.rawValue {
+            guard field.wireType == 2, let payload = field.payload, let inner = try? WireMessage(payload) else { malformed = true; continue }
+            recurring = (inner.integer(1) ?? 0) != 0
+            let from = inner.integer(2) ?? UInt64(out.from), till = inner.integer(3) ?? UInt64(out.till)
+            guard from <= 23, till <= 23 else { malformed = true; continue }
+            out.from = Int(from); out.till = Int(till)
+        }
+        out.known = !malformed
+        out.mode = always ? 2 : recurring ? 1 : 0
+        return out
+    }
+    public var summary: String {
+        !known ? "unreadable — not editable" : mode == 2 ? "always on" : mode == 1 ? String(format: "scheduled %02d:00–%02d:00", from, till) : "off"
     }
 }
 
@@ -353,12 +437,18 @@ public struct ClockHandState {
     public let awaitingConfirmation: Bool
     public let homingFailure: Bool
     public let motorFailure: Bool
+    /// Normal time-adjust movement (256) is NOT calibration; Do Not Disturb active is bit 16.
+    public let timeAdjusting: Bool
+    public let doNotDisturb: Bool
+    public let bits: UInt16
     public init(data: Data) throws {
         guard data.count == 1 || data.count == 2 else { throw ProtocolError.malformed }
         let bytes = Array(data)
         let bits = UInt16(bytes[0]) | (bytes.count == 2 ? UInt16(bytes[1]) << 8 : 0)
+        self.bits = bits
         homing = bits & 128 != 0; awaitingConfirmation = bits & 1024 != 0
         homingFailure = bits & 64 != 0; motorFailure = bits & 2048 != 0
+        timeAdjusting = bits & 256 != 0; doNotDisturb = bits & 16 != 0
     }
 }
 
@@ -523,4 +613,104 @@ public enum WeatherScenes {
         s.template = Data([0xC2, 0x95, 0x08, UInt8(ascii: "%")])
         return any ? s : nil
     }
+}
+
+// MARK: Seconds pixel (same scenes as the ESP32 bridge's comet.h, 1.20/1.21)
+
+/// A single ticking ring pixel, drawn by the clock itself from ~10-second CustomScenes.
+/// Stock firmware 1.6.7 re-initialises a scene whenever it is replaced (hence a small blip and a
+/// time/date swap at each replacement) and refuses long writes, so one scene is one ≤155-byte write.
+/// Each step is ONE Fill (life 1, Result OK) painting the new angle in the colour and the previous
+/// angle black; Fills stay drawn. Slot 1 is shared with the weather ring.
+public enum SecondsScene {
+    public static let pixels = 48, fps = 50, minuteFrames = 3000
+    public static let slot: UInt8 = 1
+    public static let windowSteps = 8
+    public static let maxCommand = 155
+    public static let outerRing = 1
+    /// Minimum steps a handoff scene fits for each LED mask 1–15 (contiguous 8 = 10 s, gapped 6 = 7.5 s).
+    public static let sceneSteps = [0, 8, 8, 8, 8, 6, 8, 8, 8, 6, 6, 6, 8, 6, 8, 8]
+    public static func validColor(_ c: Int) -> Bool { (1...24).contains(c) }
+    /// Bit 0 = outer ring (segment offset 0) … bit 3 = the LED nearest the centre.
+    public static func validRings(_ r: Int) -> Bool { (1...15).contains(r) }
+    public static func pixelAt(frame: Int) -> Int { frame * pixels / minuteFrames }
+    public static func boundaryFrame(_ pixel: Int) -> Int { (pixel * minuteFrames + pixels - 1) / pixels }
+    static func segment(_ start: Int, _ extra: Int, _ color: Int) -> UInt64 { UInt64(start) | UInt64(extra) << 8 | UInt64(color) << 16 }
+    static func radial(_ pixel: Int, _ offset: Int, _ heightField: Int, _ color: Int) -> UInt64 {
+        segment(pixel, 0, color) | UInt64(offset) << 6 | UInt64(heightField) << 14
+    }
+    static func ringRuns(_ rings: Int) -> [(offset: Int, height: Int)] {
+        var runs: [(Int, Int)] = [], b = 0
+        while b < 4 && runs.count < 2 {
+            if rings >> b & 1 == 0 { b += 1; continue }
+            let lo = b
+            while b < 4 && rings >> b & 1 != 0 { b += 1 }
+            runs.append((lo, b - 1 - lo))
+        }
+        return runs
+    }
+    static func object(method: Int, at: Int, life: Int, result: Int, field: Int, _ data: Data) -> Data {
+        var out = WireMessage.integer(1, UInt64(method))
+        if at != 0 { out += WireMessage.integer(2, UInt64(at)) }
+        out += WireMessage.integer(3, UInt64(life))
+        if result != 0 { out += WireMessage.integer(4, UInt64(result)) }
+        return out + WireMessage.bytes(field, data)
+    }
+    static func build(frame: Int, color: Int, continuation: Bool, steps: Int, rings: Int) -> Data {
+        let first = pixelAt(frame: frame), runs = ringRuns(rings)
+        var body = Data()
+        if !continuation {   // taking over: blacken all four rings once
+            body += WireMessage.bytes(1, object(method: 2, at: 0, life: 1, result: 0, field: 6, WireMessage.integer(1, 47 << 8 | 3 << 14)))
+        }
+        for i in 0..<steps {
+            let p = (first + i) % pixels, previous = (p + pixels - 1) % pixels
+            let at = i == 0 ? 0 : boundaryFrame(first + i) - frame
+            var fill = Data()
+            for r in runs { fill += WireMessage.integer(1, radial(p, r.offset, r.height, color)) }
+            for r in runs { fill += WireMessage.integer(1, radial(previous, r.offset, r.height, 0)) }
+            body += WireMessage.bytes(1, object(method: 2, at: at, life: 1, result: 0, field: 6, fill))
+        }
+        return Data([0, 0, 8, slot]) + body   // watchface overlay: the matrix keeps time/date
+    }
+    /// One scene covering up to `windowSteps` steps from `frame` (0..<3000, crossing the minute),
+    /// as many as fit in one write; `endPixel` (exclusive, may exceed 47) is the first step not covered.
+    public static func scene(frame: Int, color: Int, continuation: Bool = false, rings: Int = outerRing) -> (data: Data, endPixel: Int)? {
+        guard (0..<minuteFrames).contains(frame), validColor(color), validRings(rings) else { return nil }
+        for steps in stride(from: windowSteps, through: 1, by: -1) {
+            let data = build(frame: frame, color: color, continuation: continuation, steps: steps, rings: rings)
+            if data.count <= maxCommand { return (data, pixelAt(frame: frame) + steps) }
+        }
+        return nil
+    }
+    /// Recognised, active factory alert faces (scene characteristic 5075ffac); bit 7 = inactive.
+    public static func alertFace(_ scene: Int) -> Bool {
+        guard (0...255).contains(scene), scene & 128 == 0 else { return false }
+        return scene == 2 || scene == 3 || (8...10).contains(scene)
+    }
+    /// The bridge page's 24 native palette colours (Color enum 1–24) with preview RGB.
+    public static let colours: [(id: Int, name: String, rgb: UInt32)] = [
+        (1, "Gold", 0xB8860B),
+        (2, "Orange", 0xFF8C00),
+        (3, "Olive", 0x808000),
+        (4, "Orange red", 0xFF4500),
+        (5, "Red", 0xFF3030),
+        (6, "Maroon", 0x800000),
+        (7, "Magenta", 0x8B008B),
+        (8, "Pink", 0xC71585),
+        (9, "Brown", 0xA52A2A),
+        (10, "Indigo", 0x4B0082),
+        (11, "Violet", 0x8A2BE2),
+        (12, "White", 0xF1F7FA),
+        (13, "Slate blue", 0x8470FF),
+        (14, "Royal blue", 0x4169E1),
+        (15, "Blue", 0x2463FF),
+        (16, "Cornflower blue", 0x6495ED),
+        (17, "Sky blue", 0x87CEEB),
+        (18, "Turquoise", 0x40E0D0),
+        (19, "Aqua", 0x00FFFF),
+        (20, "Spring green", 0x00FA9A),
+        (21, "Lime green", 0x32CD32),
+        (22, "Dark green", 0x006400),
+        (23, "Lime", 0x00FF00),
+        (24, "Lawn green", 0x7CFC00)]
 }

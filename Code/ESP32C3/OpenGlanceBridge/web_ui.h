@@ -31,6 +31,10 @@ button.danger{background:var(--errbg);color:var(--err)}button:disabled{opacity:.
 .alert{background:var(--errbg);color:var(--err);border-radius:10px;padding:9px 12px;font-size:13px;margin:8px 0}
 .okbox{background:var(--okbg);color:var(--ok);border-radius:10px;padding:9px 12px;font-size:13px;margin:8px 0}
 .switch{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.night h3{font-size:14px;margin:12px 0 4px}.night .row{align-items:center}.night select{width:auto}.night .hrs{display:inline-flex;gap:6px;align-items:center;flex-wrap:nowrap}
+.leds{display:flex;align-items:center;gap:8px;margin:6px 0 2px}.leds .end{font-size:12px;color:var(--muted)}
+.led{width:30px;height:30px;padding:0;border-radius:50%;border:2px solid var(--line);background:var(--bg);color:var(--muted);font-size:11px;font-weight:700}
+.led:hover{background:var(--tealbg)}.led[aria-pressed="true"]{background:var(--teal);border-color:var(--teal);color:#fff}
 .switch:last-child{border-bottom:0}.switch input{width:20px;height:20px;accent-color:var(--teal)}
 .list{border:1px solid var(--line);border-radius:10px;max-height:220px;overflow:auto}
 .list .item{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-bottom:1px solid var(--line)}
@@ -111,36 +115,51 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 .cta{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .linkish{background:none;color:var(--tealink);padding:0;font-weight:600}.linkish:hover{background:none;text-decoration:underline}
 .scale{height:12px;border-radius:6px;background:linear-gradient(90deg,#2060ff,#00c070,#ffc000,#ff3000);margin:4px 0 2px}
+.timeChoices{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:14px 0}
+.timeChoice{border:1px solid var(--line);border-radius:11px;background:var(--bg);padding:14px}
+.timeChoice h3{font-size:14px;margin:0 0 6px}.timeChoice .row>div{flex:1;min-width:120px}
 </style></head><body>
 <header>)HTML" OG_LOGO R"HTML(<h1>OpenGlance</h1><span class="sp"></span>
 <span class="pill" id="hClock"><span class="dot"></span><span>…</span></span>
 <span class="pill" id="hTime"><span class="dot"></span><span>…</span></span>
 <span class="pill" id="hWifi"><span class="dot"></span><span>…</span></span></header>
 <nav class="tabs" id="tabs">
-<button data-t="home">Home</button><button data-t="message">Messages</button><button data-t="alarms">Alarms</button><button data-t="weather">Weather</button>
+<button data-t="home">Home</button><button data-t="alerts">Alerts</button><button data-t="alarms">Alarms</button><button data-t="weather">Weather</button>
 <button data-t="display">Display</button><button data-t="clock">Clock</button><button data-t="system">System</button></nav>
 
 <main class="tab" data-tab="home">
 <section class="card wide" id="pairCta" style="display:none"><div class="cta"><div><h2 style="margin:0 0 4px">Pair your clock</h2>
 <p class="note" style="margin:0">No clock is paired with this bridge yet.</p></div><button onclick="show('clock')">Pair a clock</button></div></section>
+<section class="card wide" id="timeCard"><div class="cta"><div><h2>Time &amp; date</h2>
+<div class="big" id="tNow">—</div></div><span class="pill" id="tMode"><span class="dot"></span><span>…</span></span></div>
+<p class="note" id="tSrc"></p>
+<div class="timeChoices"><div class="timeChoice"><h3>Internet time</h3>
+<p class="note">Keep the bridge on the correct time automatically.</p>
+<button id="bInternet" onclick="act('/api/time/internet')">Use internet time</button>
+<p class="note" id="internetState"></p></div>
+<div class="timeChoice"><h3>Manual time</h3><p class="note">Choose a date and time, then apply it. Internet time pauses until you switch back or restart.</p>
+<div class="row"><div><label for="mDate">Date</label><input type="date" id="mDate" required></div>
+<div><label for="mTime">Time</label><input type="time" id="mTime" required></div></div>
+<button class="sec" id="bManual" onclick="manualTime()">Apply manual time</button></div></div>
+<div class="row"><button class="sec" id="bSync" onclick="act('/api/sync')">Update clock now</button>
+<span class="note">The time above is bridge time. The clock reads it when it connects.</span></div></section>
 <section class="card"><h2>Clock</h2>
 <div class="big" id="cState">…</div><p class="note" id="cText"></p>
 <dl class="kv"><dt>Clock</dt><dd id="cName">—</dd><dt>Battery</dt><dd id="cBat">—</dd>
 <dt>Last time read</dt><dd id="cRead">—</dd><dt>Time supplied</dt><dd id="cSupplied">—</dd></dl>
-<div class="row"><button id="bSync" onclick="act('/api/sync')">Sync time now</button>
-<button class="sec" id="bConnect" onclick="act('/api/connect')">Connect</button>
-<button class="sec" id="bDisconnect" onclick="act('/api/disconnect')">Disconnect</button>
-<button class="sec" id="bRefresh" onclick="act('/api/refresh')">Refresh</button></div></section>
-<section class="card"><h2>Time &amp; date</h2>
-<div class="big" id="tNow">—</div><p class="note" id="tSrc"></p>
-<button class="linkish" onclick="show('system')">Time zone and manual time →</button></section>
+<button class="linkish" onclick="show('system')">Connection settings →</button></section>
+<section class="card"><h2>Time zone</h2>
+<label for="tz">Time zone (daylight saving is automatic)</label><select id="tz" onchange="tzChanged()"></select>
+<div class="row" id="tzcRow" style="display:none"><input type="text" id="tzc" placeholder="POSIX rule" style="flex:1"></div>
+<div class="row"><button class="sec" onclick="saveTZ()">Save time zone</button></div>
+<div class="switch"><span>Correct the clock daily at 03:05 and on daylight-saving changes</span><input type="checkbox" id="oDaily" onchange="act('/api/options',{daily:this.checked?1:0})"></div></section>
 <section class="card"><h2>Weather</h2><div class="big" id="wHomeNow">—</div><p class="note" id="wHomeText"></p>
 <button class="linkish" onclick="show('weather')">Weather settings →</button></section>
 <section class="card wide"><h2>Recent activity</h2><div class="log" id="logShort"></div></section>
 </main>
 
-<main class="tab" data-tab="message">
-<section class="card"><h2>Message</h2>
+<main class="tab" data-tab="alerts">
+<section class="card"><h2>Send an alert</h2>
 <label for="msgText">Text (up to 64 plain characters)</label><input type="text" id="msgText" maxlength="64" value="Hello world">
 <div class="row"><div style="flex:1"><label>Animation</label><select id="msgAnim">
 <option value="1">Pulse</option><option value="2">Wave</option><option value="10">Fire</option><option value="11">Wheel</option><option value="12">Flower</option>
@@ -152,7 +171,7 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 <button class="sec needs" onclick="testSound('#msgSound')">Test</button></div>
 <div class="row"><button class="needs" onclick="act('/api/message',{text:$('#msgText').value,animation:$('#msgAnim').value,color:$('#msgColor').value,sound:$('#msgSound').value})">Send to clock</button></div>
 <p class="note">If no sound plays, check that Mute is off on the Display tab.</p></section>
-<section class="card"><h2>Hourly chime</h2>
+<section class="card"><h2>Bridge hourly chime</h2>
 <div class="switch"><span>Chime every hour (shows the time with a sound)</span><input type="checkbox" id="chOn" onchange="act('/api/chime',{on:this.checked?1:0})"></div>
 <label for="chSound">Sound</label><div class="row" style="margin-top:0"><select id="chSound" class="sounds" style="flex:1" onchange="act('/api/chime',{sound:this.value})"></select>
 <button class="sec needs" onclick="testSound('#chSound')">Test</button></div>
@@ -160,6 +179,12 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 <span class="note">to</span><select id="chTo" class="hrs" style="flex:1"></select></div>
 <div class="row"><button class="sec" onclick="act('/api/chime',{quietFrom:$('#chFrom').value,quietTo:$('#chTo').value})">Save quiet hours</button></div>
 <p class="note">Set both to the same hour to chime around the clock. The clock also mutes sounds in its own night mode.</p></section>
+<section class="card"><h2>Clock’s built-in hourly chime</h2>
+<p class="note">A separate sound saved in the clock. It can play even when the bridge or desktop app is off. The quiet hours above do not control it.</p>
+<label for="clockChime">Saved sound</label><select id="clockChime" class="sounds needs" data-none="1" onchange="act('/api/setting',{field:15,value:this.value})"></select>
+<p class="note" id="clockChimeState">Connect the clock to read its saved sound.</p>
+<div class="row"><button class="sec needs" onclick="act('/api/refresh',{})">Read clock settings</button></div>
+<p class="note">Choose Off to stop only this chime. Alarms, timers and messages are unchanged. The value is read back after saving. Leave this Off when using the bridge chime to avoid two sounds.</p></section>
 <section class="card"><h2>Timer</h2>
 <div class="big" id="tmLeft">—</div><p class="note">The countdown here is an estimate from when the timer was sent.</p>
 <div class="row"><input type="number" id="tmMin" min="1" max="720" value="10" style="width:110px"><span class="note">minutes</span>
@@ -244,7 +269,43 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 <label>Maximum (brightest) <b id="bHighVal"></b></label><input type="range" class="needs" id="bHigh" min="0" max="255">
 <div class="row"><button class="sec needs" onclick="act('/api/brightness/range',{low:30,high:220})">Restore 30–220 defaults</button></div>
 <p class="note">Limits for the sensor-driven range, as in the original app. Changes are sent when you release a slider.</p></div></section>
-</main>
+<section class="card night"><h2>Night settings</h2>
+<p class="note">Stored on the clock. <b>Do Not Disturb</b> hides the seconds, the weather ring and notifications. <b>Silent</b> only mutes sounds, so the seconds stay visible.</p>
+<h3>Do Not Disturb</h3>
+<div class="row"><select id="dndMode" class="needs" onchange="nightEdit('dnd')" aria-label="Do Not Disturb mode"><option value="0">Off</option><option value="1">Scheduled</option><option value="2">Always</option></select>
+<span id="dndHours" class="hrs">from <select id="dndFrom" class="hours needs" onchange="nightEdit('dnd')" aria-label="Do Not Disturb starts"></select> to <select id="dndTill" class="hours needs" onchange="nightEdit('dnd')" aria-label="Do Not Disturb ends"></select></span></div>
+<div class="row"><button class="sec needs" id="dndSave" onclick="saveNight('dnd')">Save Do Not Disturb</button></div>
+<p class="note" id="dndRead" role="status">Read from clock: waiting…</p>
+<h3>Silent (quiet hours)</h3>
+<div class="row"><select id="silentMode" class="needs" onchange="nightEdit('silent')" aria-label="Silent mode"><option value="0">Off</option><option value="1">Scheduled</option><option value="2">Always</option></select>
+<span id="silentHours" class="hrs">from <select id="silentFrom" class="hours needs" onchange="nightEdit('silent')" aria-label="Silent starts"></select> to <select id="silentTill" class="hours needs" onchange="nightEdit('silent')" aria-label="Silent ends"></select></span></div>
+<div class="row"><button class="sec needs" id="silentSave" onclick="saveNight('silent')">Save Silent</button></div>
+<p class="note" id="silentRead" role="status">Read from clock: waiting…</p>
+<p class="note">Silent "Always" is the same as <b>Mute sounds</b> above. Timers and alarms may still sound while muted. For quiet nights with the seconds visible, turn Do Not Disturb off and schedule Silent for the same hours.</p></section>
+<section class="card"><h2>Comet seconds hand <span class="pill mid">Experimental</span></h2>
+<div class="switch"><span>Show a ticking seconds pixel</span><input type="checkbox" id="cometOn" onchange="saveComet()"></div>
+<p class="note">Seconds pause while the clock's Do Not Disturb is active.</p>
+<p class="note" id="cometDndState" role="status">Clock Do Not Disturb: checking…</p>
+<div class="row" style="gap:20px">
+<svg id="cometPreview" viewBox="0 0 160 160" width="140" height="140" role="img" aria-label="Illustrative comet preview, not clock telemetry" style="flex:none">
+<circle cx="80" cy="80" r="64" fill="none" stroke="var(--line)" stroke-width="2"/>
+<path d="M80 80L80 43M80 80L105 94" stroke="var(--muted)" stroke-width="3" stroke-linecap="round"/>
+<circle cx="80" cy="80" r="4" fill="var(--ink)"/><g id="cometDots"></g></svg>
+<div style="flex:1;min-width:150px"><label for="cometColor">Comet colour</label>
+<select id="cometColor" onchange="saveComet()"></select>
+<label style="margin-top:10px">LEDs that light</label>
+<div class="leds" id="cometRings" role="group" aria-label="Seconds LEDs, from the outer ring to the centre"><span class="end">Outer</span>
+<button type="button" class="led" data-bit="1" aria-pressed="true" aria-label="Outer ring LED" onclick="toggleRing(1)">1</button>
+<button type="button" class="led" data-bit="2" aria-pressed="false" aria-label="Second LED" onclick="toggleRing(2)">2</button>
+<button type="button" class="led" data-bit="4" aria-pressed="false" aria-label="Third LED" onclick="toggleRing(4)">3</button>
+<button type="button" class="led" data-bit="8" aria-pressed="false" aria-label="LED nearest the centre" onclick="toggleRing(8)">4</button><span class="end">Centre</span></div>
+<p class="note" id="cometRingsNote">1 LED · new clock scene about every 10 s</p>
+<p class="note">One lap per minute · one step every 1.25 s<br>Illustrative preview</p></div></div>
+<p id="cometStatus" class="note" role="status">Waiting for bridge status…</p>
+<div class="row"><button class="sec" id="cometRetry" onclick="saveComet()">Retry / apply</button></div>
+<p class="note">Uses the ring instead of weather while enabled. Turn it off to restore weather; your weather settings are kept. Runs on the bridge, even with this page closed.</p>
+<p class="note">Pauses for timers, alerts and calibration. Messages get a 90-second pause. Uses the clock's existing brightness and night-mode settings; this first version needs a physical smoothness/night-mode check.</p>
+</section></main>
 
 <main class="tab" data-tab="clock">
 <section class="card" id="pairCard"><h2>Pair a clock</h2>
@@ -260,9 +321,6 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 <div class="row"><button onclick="act('/api/confirm',{accept:1})">Yes, it matches</button><button class="danger" onclick="act('/api/confirm',{accept:0})">No</button></div></div>
 <details><summary>Forget the saved clock</summary><p class="note">Removes the pairing stored on this bridge only. It never resets the clock or clears the clock's own pairings.</p>
 <button class="danger" onclick="if(confirm('Forget the saved clock on this bridge?'))act('/api/forget')">Forget clock</button></details></section>
-<section class="card"><h2>Connection</h2>
-<div class="switch"><span>Keep the clock connected automatically</span><input type="checkbox" id="oAuto" onchange="act('/api/options',{auto:this.checked?1:0})"></div>
-<div class="switch"><span>Show “OpenGlance connected” (silent) after start-up, pairing or Connect</span><input type="checkbox" id="oAnnounce" onchange="act('/api/options',{announce:this.checked?1:0})"></div></section>
 <section class="card"><h2>Hand calibration</h2>
 <p class="note">State reported by the clock: <b id="hState">—</b></p>
 <div class="warn">Calibration physically moves the hands. Confirm only when the clock has stopped, shows Confirm with a green segment, and <b>both hands point exactly to 12</b>.</div>
@@ -276,16 +334,13 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 </main>
 
 <main class="tab" data-tab="system">
-<section class="card"><h2>Time &amp; date</h2>
-<label for="tz">Time zone (daylight saving is automatic)</label><select id="tz" onchange="tzChanged()"></select>
-<div class="row" id="tzcRow" style="display:none"><input type="text" id="tzc" placeholder="POSIX rule" style="flex:1"></div>
-<div class="row"><button class="sec" onclick="saveTZ()">Save time zone</button></div>
-<div class="switch"><span>Correct the clock daily at 03:05 and on daylight-saving changes</span><input type="checkbox" id="oDaily" onchange="act('/api/options',{daily:this.checked?1:0})"></div>
-<details><summary>Set a manual date &amp; time</summary>
-<p class="note">Pauses internet time until restart or until you return to internet time.</p>
-<div class="row"><input type="date" id="mDate" style="flex:1"><input type="time" id="mTime" style="flex:1"></div>
-<div class="row"><button class="sec" onclick="act('/api/time/manual',{date:$('#mDate').value,time:$('#mTime').value})">Use manual time</button>
-<button class="sec" onclick="act('/api/time/internet')">Back to internet time</button></div></details></section>
+<section class="card"><h2>Connection</h2>
+<div class="row"><button id="bConnect" onclick="act('/api/connect')">Connect clock</button>
+<button class="sec" id="bDisconnect" onclick="act('/api/disconnect')">Disconnect</button>
+<button class="sec" id="bRefresh" onclick="act('/api/refresh')">Read clock settings</button></div>
+<div class="switch"><span>Keep the clock connected automatically</span><input type="checkbox" id="oAuto" onchange="act('/api/options',{auto:this.checked?1:0})"></div>
+<div class="switch"><span>Show “OpenGlance connected” (silent) after start-up, pairing or Connect</span><input type="checkbox" id="oAnnounce" onchange="act('/api/options',{announce:this.checked?1:0})"></div>
+<p class="note" id="pollStatus">Status updates use cached bridge data, not Bluetooth reads.</p></section>
 <section class="card"><h2>Bridge firmware</h2>
 <dl class="kv"><dt>Installed</dt><dd id="fwVer">—</dd><dt>Running for</dt><dd id="fwUp">—</dd><dt>Free memory</dt><dd id="fwHeap">—</dd></dl>
 <label for="fwFile">Firmware file (OpenGlance Bridge … OTA.bin)</label><input type="file" id="fwFile" accept=".bin">
@@ -304,9 +359,14 @@ nav.tabs button:hover{background:var(--tealbg);color:var(--tealink)}nav.tabs but
 <div id="toast"></div>
 <script>)HTML" OG_TZ_JS R"HTML(
 const $=s=>document.querySelector(s);let S=null,zonesFilled=false,dragging=null,wxFilled=false;
+let pollTimer=0,refreshBusy=false,refreshAgain=false,refreshFailed=false,timeAnchor=null;
+let pendingComet=null;
+// Busy describes one serial BLE operation, not an unusable connection. Commands
+// are queued safely by the bridge; cached busy must never grey all controls.
+function controlsReady(c){return !!c.connected}
 const W={sel:$("#wSel"),btn:$("#wScan"),note:$("#wNote"),other:$("#wOther"),pass:$("#wPass"),passWrap:$("#wPassWrap")};
 $("#wifiDetails").addEventListener("toggle",e=>{if(e.target.open&&W.sel.options.length<2)scanInto(W)});
-function show(t){document.querySelectorAll(".tab").forEach(m=>m.classList.toggle("on",m.dataset.tab===t));
+function show(t){if(t==="message")t="alerts";document.querySelectorAll(".tab").forEach(m=>m.classList.toggle("on",m.dataset.tab===t));
 document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));if(location.hash!=="#"+t)history.replaceState(null,"","#"+t);window.scrollTo(0,0)}
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>show(b.dataset.t));
 function fromHash(){show((location.hash||"#home").slice(1).replace(/[^a-z]/g,"")||"home");if(!document.querySelector(".tab.on"))show("home")}
@@ -314,9 +374,48 @@ fromHash();window.addEventListener("hashchange",fromHash);
 function toast(t,e){const x=$("#toast");x.textContent=t;x.className="show"+(e?" err":"");clearTimeout(x._t);x._t=setTimeout(()=>x.className="",4500)}
 async function act(url,data){try{const r=await fetch(url,{method:"POST",body:new URLSearchParams(data||{})});const j=await r.json();
 if(!j.ok)toast(j.error||"Request failed",true);else if(j.message)toast(j.message);setTimeout(refresh,300);return j}catch(e){toast("The bridge did not respond",true)}}
+function manualTime(){if(!$("#mDate").reportValidity()||!$("#mTime").reportValidity())return;
+return act('/api/time/manual',{date:$("#mDate").value,time:$("#mTime").value})}
 function wxSave(d){return act("/api/weather",d)}
+const nightDraft={dnd:0,silent:0};
+document.querySelectorAll("select.hours").forEach(sel=>{for(let h=0;h<24;h++)sel.add(new Option(String(h).padStart(2,"0")+":00",String(h)))});
+function nightShowHours(w){$("#"+w+"Hours").style.display=$("#"+w+"Mode").value==="1"?"":"none"}
+function nightEdit(w){nightDraft[w]=performance.now()+60000;nightShowHours(w)}
+function nightText(x){return !x?"not read yet":!x.known?"unreadable — not editable":x.mode===2?"always on":x.mode===1?"scheduled "+String(x.from).padStart(2,"0")+":00–"+String(x.till).padStart(2,"0")+":00":"off"}
+async function saveNight(w){const mode=Number($("#"+w+"Mode").value),from=Number($("#"+w+"From").value),till=Number($("#"+w+"Till").value);
+if(mode===1&&from===till)return toast("Start and end hours must differ",true);
+nightDraft[w]=performance.now()+10000;const r=await act("/api/night",{which:w,mode,from,till});if(!r?.ok)nightDraft[w]=0;return r}
+function nightRefresh(g,ready){for(const w of ["dnd","silent"]){const x=g?.[w];$("#"+w+"Read").textContent="Read from clock: "+nightText(x);
+const ok=ready&&x&&x.known;["Mode","From","Till","Save"].forEach(k=>$("#"+w+k).disabled=!ok);
+if(x&&x.known&&performance.now()>=nightDraft[w]){nightDraft[w]=0;$("#"+w+"Mode").value=String(x.mode);$("#"+w+"From").value=String(x.from);$("#"+w+"Till").value=String(x.till)}
+nightShowHours(w)}}
+let cometRings=1,cometSceneSteps=[8,8,8,8,6,8,8,8,6,6,6,8,6,8,8];
+function ringGap(m){return /10+1/.test(m.toString(2))}
+function renderRings(){document.querySelectorAll("#cometRings .led").forEach(b=>b.setAttribute("aria-pressed",cometRings&Number(b.dataset.bit)?"true":"false"));
+const n=[1,2,4,8].filter(b=>cometRings&b).length,secs=(cometSceneSteps[cometRings-1]||8)*1.25;
+$("#cometRingsNote").textContent=n+(n===1?" LED":" LEDs")+" · new clock scene about every "+(Number.isInteger(secs)?secs:secs.toFixed(1))+" s"+(ringGap(cometRings)?" (a gap needs more data per tick)":"")}
+function toggleRing(bit){const next=cometRings^bit;if(!next)return toast("Keep at least one LED lit",true);cometRings=next;renderRings();saveComet()}
+async function saveComet(){const data={on:$("#cometOn").checked?1:0,color:$("#cometColor").value,rings:cometRings};
+const draft={...data,until:performance.now()+10000};pendingComet=draft;
+const result=await act("/api/comet",data);if(!result?.ok&&pendingComet===draft)pendingComet=null;return result}
+function cometDraftWaiting(c){if(!pendingComet)return false;
+const matched=c&&Number(c.on)===pendingComet.on&&Number(c.color)===Number(pendingComet.color)&&Number(c.rings||1)===Number(pendingComet.rings||1);
+if(matched||performance.now()>=pendingComet.until){pendingComet=null;return false}return true}
+const COMET_COLORS=[[1,"Gold","#b8860b"],[2,"Orange","#ff8c00"],[3,"Olive","#808000"],[4,"Orange red","#ff4500"],[5,"Red","#ff3030"],
+[6,"Maroon","#800000"],[7,"Magenta","#8b008b"],[8,"Pink","#c71585"],[9,"Brown","#a52a2a"],[10,"Indigo","#4b0082"],[11,"Violet","#8a2be2"],
+[12,"White","#f1f7fa"],[13,"Slate blue","#8470ff"],[14,"Royal blue","#4169e1"],[15,"Blue","#2463ff"],[16,"Cornflower blue","#6495ed"],
+[17,"Sky blue","#87ceeb"],[18,"Turquoise","#40e0d0"],[19,"Aqua","#00ffff"],[20,"Spring green","#00fa9a"],[21,"Lime green","#32cd32"],
+[22,"Dark green","#006400"],[23,"Lime","#00ff00"],[24,"Lawn green","#7cfc00"]];
+COMET_COLORS.forEach(([id,n])=>$("#cometColor").add(new Option(n,id)));$("#cometColor").value="18";
+const cometDots=[];[64,56,48,40].forEach((r,ring)=>{for(let i=0;i<48;i++){const d=document.createElementNS("http://www.w3.org/2000/svg","circle"),a=i*Math.PI/24-Math.PI/2;
+d.setAttribute("cx",80+r*Math.cos(a));d.setAttribute("cy",80+r*Math.sin(a));d.setAttribute("r","2.6");$("#cometDots").append(d);cometDots.push({d,i,ring})}});
+function animateComet(){if(document.hidden||!document.querySelector('[data-tab="display"].on')){requestAnimationFrame(animateComet);return}
+const phase=(Date.now()%60000)/1250,col=COMET_COLORS.find(x=>String(x[0])===$("#cometColor").value)?.[2]||"#40e0d0";
+const head=Math.floor(phase);cometDots.forEach(({d,i,ring})=>{d.setAttribute("fill",col);d.setAttribute("opacity",i===head&&(cometRings>>ring&1)?"1":"0.08")});
+requestAnimationFrame(animateComet)}requestAnimationFrame(animateComet);
 const SOUNDS=["None","Waves","Rise","Charging","Steps","Radar","Bells","Bye","Hello","Flowers","Circles","Complete","Popcorn","Break","Opening","High","Shine","Extension"];
 document.querySelectorAll("select.sounds").forEach(sel=>{SOUNDS.forEach((n,i)=>{if(i||sel.dataset.none)sel.add(new Option(n,i))})});
+$("#clockChime").options[0].text="Off";
 $("#msgSound").value="0";
 document.querySelectorAll("select.hrs").forEach(sel=>{for(let h=0;h<24;h++)sel.add(new Option(String(h).padStart(2,"0")+":00",h))});
 const DAYS=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];let alIndex=-1;
@@ -398,7 +497,7 @@ pill($("#hClock"),st[1],"Clock: "+st[0]);pill($("#hTime"),s.time.valid?(s.time.s
 pill($("#hWifi"),s.wifi.connected?"good":"bad",s.wifi.connected?"Wi-Fi "+s.wifi.ip:(s.wifi.ap?"Setup hotspot":"Wi-Fi offline"));
 $("#cState").textContent=st[0];$("#cText").textContent=c.text;$("#cName").textContent=c.name||"—";
 $("#cBat").textContent=c.battery>=0?c.battery+"%":"—";$("#cRead").textContent=c.lastRead||"Not yet on this connection";$("#cSupplied").textContent=c.supplied||"—";
-const ready=c.connected&&!c.busy;document.querySelectorAll(".needs").forEach(e=>e.disabled=!ready);
+const ready=controlsReady(c);document.querySelectorAll(".needs").forEach(e=>e.disabled=!ready);
 $("#bSync").disabled=!ready||!s.time.valid;$("#bConnect").disabled=c.connected||!c.paired||c.busy;$("#bDisconnect").disabled=!c.connected;$("#bRefresh").disabled=!ready;
 for(const[id,v]of[["#oAuto",c.auto],["#oAnnounce",c.announce],["#oDaily",s.time.daily],["#chOn",c.chime.on]])if(document.activeElement!==$(id))$(id).checked=v;
 if(document.activeElement!==$("#chSound"))$("#chSound").value=String(c.chime.sound);
@@ -413,20 +512,57 @@ if(L._k!==key){L._k=key;L.innerHTML="";for(const it of s.scan.items){const d=doc
 d.innerHTML="<span><b></b><br><span class='note'></span></span>";d.querySelector("b").textContent=it.name;d.querySelector(".note").textContent=it.addr+" · "+it.rssi+" dBm";
 const b=document.createElement("button");b.textContent="Pair";b.disabled=c.busy;b.onclick=()=>act("/api/pair",{i:it.i});d.append(b);L.append(d)}}
 $("#tNow").textContent=s.time.valid?s.time.local:"Waiting for internet time…";
+timeAnchor=s.time.valid?{wall:Date.parse(s.time.local.replace(" ","T")+"Z"),at:performance.now()}:null;
+pill($("#tMode"),s.time.source==="manual"?"mid":s.time.valid?"good":"mid",s.time.source==="manual"?"Active: manual time":s.time.valid?"Active: internet time":"Internet time · waiting");
+$("#internetState").textContent=s.time.source==="manual"?"Internet time is paused. Switch back here at any time.":s.time.valid?"Internet time is active.":"Waiting for internet time…";
 $("#tSrc").textContent=(s.time.source==="manual"?"Manual time":"Internet time")+(s.time.lastNtp?" · last internet sync "+s.time.lastNtp:"")+" · "+s.time.tzName;
 if(!zonesFilled){zonesFilled=true;const found=fillZones($("#tz"),s.time.tz);if(!found)$("#tzc").value=s.time.tz;tzChanged();
-const now=new Date();$("#mDate").value=now.toISOString().slice(0,10);$("#mTime").value=now.toTimeString().slice(0,5)}
+const now=new Date(),date=s.time.valid?s.time.local.slice(0,10):[now.getFullYear(),String(now.getMonth()+1).padStart(2,"0"),String(now.getDate()).padStart(2,"0")].join("-");
+$("#mDate").value=date;$("#mTime").value=s.time.valid?s.time.local.slice(11,16):now.toTimeString().slice(0,5)}
 $("#tmLeft").textContent=fmtDur(c.timerRemaining);
 const g=c.settings;if(g){document.querySelectorAll("input[data-f]").forEach(cb=>{if(document.activeElement!==cb)cb.checked={11:g.digitalTime,12:g.twelveHour,9:g.hourPoints,2:g.nightMode,4:g.muted}[cb.dataset.f]});
 if(document.activeElement!==$("#dateFmt"))$("#dateFmt").value=g.dateFormat;const auto=g.brightness===0;$("#bAuto").checked=auto;
 $("#manualBox").style.display=auto?"none":"block";$("#autoBox").style.display=auto?"block":"none";
 if(!dragging){$("#bMan").value=g.brightness||128;$("#bLow").value=g.autoLow;$("#bHigh").value=g.autoHigh;labels()}}
-const h=c.hand;$("#hState").textContent=!h.valid?"not reported":h.motorFailure?"motor failure":h.homingFailure?"homing failure":h.homing?"hands moving…":h.awaiting?"waiting for confirmation":"idle";
-$("#bCalStart").disabled=!ready||h.homing;$("#bCalConfirm").disabled=!ready||h.homing||!(h.awaiting||c.calibrationRequested);
+nightRefresh(g,ready);
+const cs=$("#clockChime"),cv=g?.builtInChimeSound;cs.disabled=!ready||cv===undefined;
+if(document.activeElement!==cs){cs.querySelectorAll("option[data-unknown]").forEach(o=>o.remove());
+if(cv!==undefined&&!(cv>=0&&cv<SOUNDS.length)){const o=new Option("Unknown sound ("+cv+")",String(cv));o.dataset.unknown="1";o.disabled=true;cs.add(o)}
+cs.value=cv===undefined?"":String(cv)}
+$("#clockChimeState").textContent=cv===undefined?"Saved sound not read yet.":"Read from clock: "+(cv===0?"Off":SOUNDS[cv]||"Unknown sound ("+cv+")");
+const comet=c.comet;$("#cometOn").disabled=$("#cometColor").disabled=$("#cometRetry").disabled=!comet;
+document.querySelectorAll("#cometRings .led").forEach(b=>b.disabled=!comet);
+if(comet&&Array.isArray(comet.sceneSteps)&&comet.sceneSteps.length===15)cometSceneSteps=comet.sceneSteps;
+if(comet){const saving=cometDraftWaiting(comet);
+if(!saving){if(document.activeElement!==$("#cometOn"))$("#cometOn").checked=comet.on;
+if(document.activeElement!==$("#cometColor"))$("#cometColor").value=String(comet.color);
+if(comet.rings>=1&&comet.rings<=15)cometRings=comet.rings}
+renderRings();
+$("#cometStatus").textContent=saving?"Saving your seconds options…":comet.status||"Saved — waiting for clock";
+$("#cometDndState").textContent=!c.connected?"Clock Do Not Disturb: not connected":comet.stateFresh===false?"Clock Do Not Disturb: waiting for fresh status":
+"Clock Do Not Disturb: "+(comet.dndActive?"active":"inactive")+". Automatic night mode is a separate setting."}
+else $("#cometStatus").textContent="Install Bridge 1.12 or newer to use the comet.";
+const h=c.hand;$("#hState").textContent=!h.valid?"not reported":h.motorFailure?"motor failure":h.homingFailure?"homing failure":h.homing?"calibrating hands…":h.awaiting?"waiting for confirmation":h.timeAdjusting?"setting hands to the time · not calibration":"idle";
+$("#bCalStart").disabled=!ready||h.homing||h.awaiting||h.timeAdjusting||c.calibrationRequested;$("#bCalConfirm").disabled=!ready||h.homing||!(h.awaiting||c.calibrationRequested);
 $("#fwVer").textContent=s.fw;$("#fwUp").textContent=fmtDur(s.uptime);$("#fwHeap").textContent=Math.round(s.heap/1024)+" KB";
 $("#nSsid").textContent=s.wifi.ssid||"—";$("#nIp").textContent=s.wifi.connected?s.wifi.ip+" · openglance.local":"—";$("#nRssi").textContent=s.wifi.connected?s.wifi.rssi+" dBm":"—";
-if(s.weather)renderWeather(s);if(c.alarms)renderAlarms(c);logInto($("#log"),s.log);logInto($("#logShort"),s.log.slice(0,6))}
-async function refresh(){try{const r=await fetch("/api/status",{cache:"no-store"});if(r.ok)render(await r.json())}catch(e){pill($("#hWifi"),"bad","Bridge offline")}}
+if(s.weather)renderWeather(s);
+if(comet?.on){$("#wHomeText").textContent="Weather ring paused · comet selected";$("#wStatus").textContent="Weather ring paused while the comet is enabled. Forecast and saved settings are kept."}
+if(c.alarms)renderAlarms(c);logInto($("#log"),s.log);logInto($("#logShort"),s.log.slice(0,6))}
+function pollDelay(){if(refreshFailed)return 10000;
+if(pendingComet)return 500; // brief acknowledgement checks only after a user edit
+const c=S?.clock;if(S?.scan?.running||["scanning","connecting","securing","awaiting_pin","awaiting_confirm"].includes(c?.state))return 1500;
+return c?.comet?.on?8000:5000}
+function scheduleRefresh(){clearTimeout(pollTimer);if(document.hidden)return;
+const delay=refreshAgain?250:pollDelay();refreshAgain=false;
+$("#pollStatus").textContent="Cached status every "+Math.round(delay/1000)+" seconds · no Bluetooth reads. Automatic updates pause when this page is hidden.";
+pollTimer=setTimeout(refresh,delay)}
+async function refresh(){if(refreshBusy){refreshAgain=true;return}clearTimeout(pollTimer);refreshBusy=true;
+try{const r=await fetch("/api/status",{cache:"no-store"});if(!r.ok)throw new Error("Status unavailable");render(await r.json());refreshFailed=false}
+catch(e){refreshFailed=true;pill($("#hWifi"),"bad","Bridge offline")}
+finally{refreshBusy=false;scheduleRefresh()}}
+document.addEventListener("visibilitychange",()=>{if(document.hidden)clearTimeout(pollTimer);else refresh()});
+setInterval(()=>{if(!document.hidden&&timeAnchor&&Number.isFinite(timeAnchor.wall))$("#tNow").textContent=new Date(timeAnchor.wall+performance.now()-timeAnchor.at).toISOString().slice(0,19).replace("T"," ")},1000);
 function upload(){const f=$("#fwFile").files[0];if(!f)return toast("Choose the OTA .bin file first",true);
 if(!confirm("Install "+f.name+"? The bridge restarts afterwards."))return;const fd=new FormData();fd.append("firmware",f,f.name);
 const x=new XMLHttpRequest();const p=$("#fwProg");p.style.display="block";p.value=0;$("#bUpload").disabled=true;
@@ -434,5 +570,5 @@ x.upload.onprogress=e=>{if(e.lengthComputable)p.value=e.loaded/e.total*100};
 x.onload=()=>{$("#bUpload").disabled=false;let j={};try{j=JSON.parse(x.responseText)}catch(e){}
 if(j.ok){toast("Installed "+(j.version||"")+". Restarting…");setTimeout(()=>location.reload(),9000)}else{toast(j.error||"Update failed",true);p.style.display="none"}};
 x.onerror=()=>{$("#bUpload").disabled=false;toast("Upload failed",true)};x.open("POST","/update");x.send(fd)}
-refresh();setInterval(refresh,1500);
+refresh();
 </script></body></html>)HTML";

@@ -31,6 +31,7 @@
 #include "version.h"
 #include "glance_protocol.h"
 #include "weather.h"
+#include "comet.h"
 #include "web_ui.h"
 
 using glance::Bytes;
@@ -63,6 +64,9 @@ struct Config {
     String clockAddr, clockName, clockIdAddr;
     uint8_t clockAddrType = 0, clockIdType = 0;
     bool autoConnect = true, dailySync = true, announce = true;
+    bool cometOn = false;             // opt-in; never replaces weather on upgrade
+    int cometColor = 18;              // Turquoise, native Color enum
+    int cometRings = comet::kOuterRing; // which radial LEDs light: bit 0 outer … bit 3 centre
     // Weather widgets
     bool wxOn = false, wxTemp = true, wxF = false, wxText = false;
     uint8_t wxRainMode = 1;          // 0 off, 1 alternate with temperature, 2 instead of temperature
@@ -95,6 +99,13 @@ void loadConfig() {
     cfg.autoConnect = prefs.getBool("auto", true);
     cfg.dailySync = prefs.getBool("daily", true);
     cfg.announce = prefs.getBool("announce", true);
+    cfg.cometOn = prefs.getBool("cometon", false);
+    cfg.cometColor = prefs.getInt("cometcolor", 18);
+    cfg.cometRings = prefs.getInt("cometrings", comet::kOuterRing);
+    // Legacy cometdnd is deliberately ignored; the removed override did not
+    // bypass stock firmware. Do not modify the clock's actual DND settings.
+    if (!comet::validColor(cfg.cometColor)) cfg.cometColor = 18;
+    if (!comet::validRings(cfg.cometRings)) cfg.cometRings = comet::kOuterRing;
     cfg.wxOn = prefs.getBool("wxon", false);
     cfg.wxTemp = prefs.getBool("wxtemp", true);
     cfg.wxRainMode = prefs.getUChar("wxrainmode", prefs.getBool("wxrain", true) ? 1 : 0);
@@ -157,6 +168,9 @@ void saveConfig() {
     prefs.putBool("auto", cfg.autoConnect);
     prefs.putBool("daily", cfg.dailySync);
     prefs.putBool("announce", cfg.announce);
+    prefs.putBool("cometon", cfg.cometOn);
+    prefs.putInt("cometcolor", cfg.cometColor);
+    prefs.putInt("cometrings", cfg.cometRings);
     prefs.putBool("wxon", cfg.wxOn);
     prefs.putBool("wxtemp", cfg.wxTemp);
     prefs.putUChar("wxrainmode", cfg.wxRainMode);
@@ -215,6 +229,7 @@ struct State {
     bool busy = false;
     glance::Settings settings;
     glance::HandState hand;
+    uint32_t handUpdated = 0;
     bool calibrationRequested = false;
     time_t timerEnd = 0;
     time_t lastTimeRead = 0;
@@ -235,6 +250,8 @@ struct State {
     String wxError;
     int wxShowing = 0;            // 0 nothing, 1 temperature, 2 rain
     bool wxRainDue = false;
+    bool cometRunning = false;
+    String cometText = "Off";
 } st;
 
 static volatile bool linkDown = false;
@@ -254,6 +271,19 @@ static bool wxSlotUnknown = true;               // after boot we do not know wha
 static bool wxOldSlotCleanup = true;            // remove the second scene used by 1.06/1.07
 static bool wxPhaseRain = false;                // alternating: rain is the current ring
 static Bytes wxLastCommand;                     // skip identical re-sends
+// Clock-task-only playback bookkeeping. A failed animation write is latched:
+// no automatic retry until the owner explicitly saves/retries the comet.
+static bool cometOwnsSlot = false, cometFailed = false;
+static uint32_t cometHoldUntil = 0;
+// Absolute step (minutes since epoch × 48 + pixel) the current scene does NOT
+// cover; -1 = no scene. The next scene is sent when this step begins.
+static int64_t cometNextStep = -1;
+
+String sceneStepsJson() {
+    String j;
+    for (int m = 1; m <= 15; ++m) { if (m > 1) j += ","; j += String(comet::kSceneSteps[m]); }
+    return j;   // index 0 = mask 1
+}
 
 void logEvent(const String& text, bool error = false) {
     Serial.printf("[%s] %s\n", error ? "ERR" : "log", text.c_str());
@@ -287,6 +317,9 @@ String formatLocal(time_t t, const char* fmt = "%Y-%m-%d %H:%M:%S") {
 static NimBLEClient* client = nullptr;
 static NimBLERemoteCharacteristic* control = nullptr;
 static NimBLERemoteCharacteristic* batteryChr = nullptr;
+static NimBLERemoteCharacteristic* sceneChr = nullptr;
+static NimBLERemoteCharacteristic* handChr = nullptr;
+static uint32_t handReadAttempt = 0;
 static NimBLECharacteristic* ctsCurrent = nullptr;
 static NimBLECharacteristic* ctsLocal = nullptr;
 
@@ -357,11 +390,13 @@ void onHandState(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
         Lock l;
         changed = h.bits != st.hand.bits || !st.hand.valid;
         st.hand = h;
+        st.handUpdated = millis();
         if (!h.homing && !h.awaitingConfirmation) st.calibrationRequested = false;
     }
     if (changed) {
         String text = h.motorFailure ? "motor failure" : h.homingFailure ? "homing failure" : h.homing ? "hands moving to reference"
-                    : h.awaitingConfirmation ? "waiting for alignment confirmation" : "no calibration in progress";
+                    : h.awaitingConfirmation ? "waiting for alignment confirmation"
+                    : h.timeAdjusting ? "setting hands to the time (not calibration)" : "no calibration in progress";
         logEvent("Hand state: " + text, h.motorFailure || h.homingFailure);
     }
 }
@@ -397,7 +432,7 @@ void setupBluetooth() {
 enum CmdType : uint8_t {
     CMD_SCAN, CMD_PAIR, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET, CMD_SYNC, CMD_MESSAGE,
     CMD_TIMER, CMD_TIMER_STOP, CMD_SETTING, CMD_RANGE, CMD_CAL_START, CMD_CAL_CONFIRM, CMD_REFRESH,
-    CMD_ALARMS_SYNC, CMD_ALARM_STOP
+    CMD_ALARMS_SYNC, CMD_ALARM_STOP, CMD_COMET, CMD_NIGHT
 };
 void sendWeather(bool userTriggered);
 struct Command {
@@ -443,10 +478,18 @@ void readBattery() {
 void resetLinkObjects() {
     control = nullptr;
     batteryChr = nullptr;
+    sceneChr = nullptr;
+    handChr = nullptr;
+    handReadAttempt = 0;
+    cometOwnsSlot = false;
+    cometNextStep = -1;
     Lock l;
     st.battery = -1;
     st.settings = glance::Settings();
     st.hand = glance::HandState();
+    st.handUpdated = 0;
+    st.cometRunning = false;
+    st.cometText = cfg.cometOn ? "Waiting for the clock" : "Off — weather ring available";
     st.timeSubscribed = false;
     st.calibrationRequested = false;
 }
@@ -488,12 +531,13 @@ bool openLink(const NimBLEAddress& address, const String& name, bool pairing) {
         return false;
     }
     control = ctl;
-    NimBLERemoteCharacteristic* stateChr = svc->getCharacteristic(glance::kStateUUID);
-    if (stateChr) {
-        if (stateChr->canNotify()) stateChr->subscribe(true, onHandState, true);
-        if (stateChr->canRead()) {
-            NimBLEAttValue v = stateChr->readValue();
-            if (v.size()) onHandState(stateChr, const_cast<uint8_t*>(v.data()), v.size(), false);
+    sceneChr = svc->getCharacteristic("5075ffac-1e0e-11e7-93ae-92361f002671");
+    handChr = svc->getCharacteristic(glance::kStateUUID);
+    if (handChr) {
+        if (handChr->canNotify()) handChr->subscribe(true, onHandState, true);
+        if (handChr->canRead()) {
+            NimBLEAttValue v = handChr->readValue();
+            if (v.size()) onHandState(handChr, const_cast<uint8_t*>(v.data()), v.size(), false);
         }
     }
     if (NimBLERemoteService* bat = client->getService("180F")) {
@@ -586,6 +630,8 @@ bool timerRunning() { Lock l; return st.timerEnd > time(nullptr); }
 // cycles scenes by itself. Shows temperature, or rain when rain is coming:
 // alternating on the owner's interval, or instead of temperature.
 void sendWeather(bool userTriggered) {
+    // One shared ring slot: two simultaneous scenes would rotate unexpectedly.
+    if (cfg.cometOn) return;
     if (!linkUp() || !timeIsValid()) return;
     weather::Forecast f;
     { Lock l; if (st.hand.homing || st.hand.awaitingConfirmation) return; f = st.forecast; }
@@ -640,6 +686,145 @@ void sendWeather(bool userTriggered) {
     }
 }
 bool handsBusy() { Lock l; return st.hand.homing || st.hand.awaitingConfirmation || st.calibrationRequested; }
+
+// Serial clock-task reads, independent of HTTP polling. Notifications alone
+// can leave movement/DND flags stale, especially across a time change.
+bool readHandState() {
+    handReadAttempt = millis();
+    if (!linkUp() || !handChr || !handChr->canRead()) return false;
+    NimBLEAttValue v = handChr->readValue();
+    if (v.size() != 1 && v.size() != 2) {
+        Lock l; st.hand.valid = false;
+        return false;
+    }
+    onHandState(handChr, const_cast<uint8_t*>(v.data()), v.size(), false);
+    return true;
+}
+
+void cometStatus(const String& text, bool running = false) {
+    Lock l; st.cometText = text; st.cometRunning = running;
+}
+void suspendComet(uint32_t holdMs = 0) {
+    if (holdMs) cometHoldUntil = millis() + holdMs;
+    cometNextStep = -1;
+    if (cometOwnsSlot && linkUp()) {
+        if (!writeControl(weather::deleteSceneCommand(comet::kSlot), "Pause seconds comet")) {
+            cometFailed = true;
+            cometStatus("Stopped after a Bluetooth error — press Retry");
+            return;
+        }
+        cometOwnsSlot = false;
+        wxLastCommand.clear(); wxSlotUnknown = true;
+    }
+}
+
+void updateComet() {
+    bool enabled, dnd, nativeChime;
+    int color, rings;
+    { Lock l; enabled = cfg.cometOn; color = cfg.cometColor; rings = cfg.cometRings;
+      dnd = st.hand.valid && st.hand.dnd;
+      nativeChime = st.settings.valid && st.settings.builtInChimeSound != 0; }
+    if (!enabled) {
+        if (cometOwnsSlot) { suspendComet(); wxSendRequested = true; }
+        if (!cometFailed) cometStatus("Off — weather ring available");
+        return;
+    }
+    if (cometFailed) { cometStatus("Stopped after a Bluetooth error — press Retry"); return; }
+    if (!linkUp()) { cometStatus("Waiting for the clock"); return; }
+    if (!timeIsValid()) { cometStatus("Waiting for valid bridge time"); suspendComet(); return; }
+    bool blockedState;
+    { Lock l; blockedState = !st.hand.valid || comet::calibrationPauses(st.hand, st.calibrationRequested) ||
+                            st.hand.dnd; }
+    // Faster recovery while paused, slow read-only checks while playing.
+    if (uint32_t(millis() - handReadAttempt) >= (blockedState ? 2000u : 5000u)) readHandState();
+    bool fresh;
+    { Lock l; fresh = comet::stateFresh(st.hand.valid, millis(), st.handUpdated);
+      dnd = st.hand.valid && st.hand.dnd; }
+    if (!fresh) {
+        suspendComet();
+        if (!cometFailed) cometStatus("Paused — waiting for fresh clock status");
+        return;
+    }
+    struct timeval tv; gettimeofday(&tv, nullptr);
+    struct tm local; localtime_r(&tv.tv_sec, &local);
+    bool alarmDue = false;
+    { Lock l;
+      for (const auto& a : cfg.alarms) {
+          int day = local.tm_wday == 0 ? 6 : local.tm_wday - 1;
+          if (a.enabled && a.alarm.hour == local.tm_hour && a.alarm.minute == local.tm_min &&
+              (!a.alarm.days || (a.alarm.days & (1 << day)))) alarmDue = true;
+      }
+    }
+    bool timer = timerRunning(), hand;
+    { Lock l; hand = comet::calibrationPauses(st.hand, st.calibrationRequested); }
+    static bool wasTimer = false;
+    if (wasTimer && !timer) cometHoldUntil = millis() + 15000; // timer-complete sound/animation
+    wasTimer = timer;
+    bool cooldown = cometHoldUntil && int32_t(millis() - cometHoldUntil) < 0;
+    bool alert = alarmDue || (nativeChime && local.tm_min == 0);
+    bool dndBlocked = comet::dndPauses(dnd);
+    if (!comet::canRun(enabled, true, true, hand, timer, dndBlocked, alert, cooldown, false)) {
+        suspendComet();
+        if (!cometFailed) cometStatus(hand ? "Paused for hand calibration" : timer ? "Paused for the timer" :
+            dndBlocked ? "Paused — clock Do Not Disturb" : alert ? "Paused for an alarm or hourly chime" : "Paused for a message or timer finish");
+        return;
+    }
+    int frame = local.tm_sec * comet::kFPS + int(tv.tv_usec / 20000);
+    int64_t step = int64_t(tv.tv_sec / 60) * comet::kPixels + comet::pixelAt(frame);
+    // Still inside the steps the current scene draws by itself (about 10 s).
+    // A clock step backwards by more than a minute is a resynchronisation.
+    if (cometOwnsSlot && cometNextStep >= 0 && step < cometNextStep && step > cometNextStep - 2 * comet::kPixels) return;
+    // Read the active face before each scene (about every 10 s). Unknown status fails closed:
+    // do not overwrite an alarm/notification we cannot identify.
+    if (!sceneChr || !sceneChr->canRead()) {
+        suspendComet(); cometStatus("Unavailable: clock display status cannot be read"); return;
+    }
+    NimBLEAttValue face = sceneChr->readValue();
+    if (face.size() != 1) {
+        cometFailed = true; suspendComet(); cometStatus("Display-status read failed — press Retry");
+        logEvent("Seconds comet stopped: could not read the active clock face", true); return;
+    }
+    if (comet::alertFace(face[0])) {
+        suspendComet(5000); cometStatus("Paused for the clock's alert display"); return;
+    }
+    Bytes data;
+    // Continuation = the previous scene covered every step up to now, so this
+    // one needs no ring clear; its first step redraws head + tail on frame 0.
+    bool continuation = cometOwnsSlot && step == cometNextStep;
+    int endPixel = 0;
+    if (!comet::scene(frame, color, data, continuation, &endPixel, rings)) return;
+    bool starting = !cometOwnsSlot;
+    if (starting) {
+        // 1.20: weather forecasts appear to be stored apart from custom scenes, so the
+        // seconds scene in slot 1 does not replace an old forecast; the clock then
+        // kept cycling a stale rain ring with the date (owner report, weather Off).
+        // Remove the bridge's own weather slots once before taking over the ring.
+        if (!writeControl(weather::deleteSceneCommand(weather::kRainSlot), "Remove old weather scene (slot 2)") ||
+            !writeControl(weather::deleteSceneCommand(weather::kWeatherSlot), "Remove old weather scene (slot 1)")) {
+            cometOwnsSlot = true; // a timeout may have acted; explicit Off/Retry must clean up
+            cometFailed = true;
+            cometStatus("Stopped after a Bluetooth error — press Retry"); return;
+        }
+        logEvent("Removed old weather scenes (slots 1–2) before starting seconds");
+    }
+    if (writeControl(data, "Seconds comet")) {
+        cometOwnsSlot = true; cometNextStep = step + (endPixel - comet::pixelAt(frame));
+        // Start once, not on every update. Command 31 is the reference's silent
+        // start; unlike 35 it does not show the obsolete cloud-fetch animation.
+        if (starting && !writeControl(Bytes{31, 0, 0, 0}, "Start seconds scene")) {
+            cometFailed = true;
+            cometStatus("Stopped after a Bluetooth error — press Retry"); return;
+        }
+        wxLastCommand.clear(); wxSlotUnknown = true;
+        { Lock l; st.wxShowing = 0; }
+        cometStatus("Playing · single pixel, new scene about every 10 s", true);
+        if (starting) logEvent("Seconds comet started (ring only, silent)");
+    } else {
+        cometOwnsSlot = true; // a timeout may have acted; explicit Off/Retry must clean up
+        cometFailed = true;
+        cometStatus("Stopped after a Bluetooth error — press Retry");
+    }
+}
 
 // Reconnects so the clock re-reads Current Time on connection.
 void doSync(const String& why) {
@@ -730,12 +915,14 @@ void handleCommand(const Command& cmd) {
         case CMD_MESSAGE: {
             Bytes data;
             if (!glance::notice(cmd.text, cmd.a, cmd.b, cmd.c, data)) { logEvent("Message rejected: use 1–64 plain characters", true); break; }
+            suspendComet(90000);
             if (writeControl(data, "Message")) logEvent("Message sent: " + String(cmd.text));
             break;
         }
         case CMD_TIMER: {
             Bytes data;
             if (!glance::timer(cmd.a * 60, data)) { logEvent("Timer must be 1–720 minutes", true); break; }
+            suspendComet();
             if (writeControl(data, "Timer")) {
                 { Lock l; st.timerEnd = time(nullptr) + cmd.a * 60; }
                 logEvent("Timer started: " + String(cmd.a) + " min (countdown here is an estimate)");
@@ -743,6 +930,7 @@ void handleCommand(const Command& cmd) {
             break;
         }
         case CMD_TIMER_STOP:
+            suspendComet(2000);
             if (writeControl(Bytes(glance::kStopTimer, glance::kStopTimer + 1), "Timer stop")) {
                 { Lock l; st.timerEnd = 0; }
                 logEvent("Timer stopped");
@@ -750,7 +938,24 @@ void handleCommand(const Command& cmd) {
             break;
         case CMD_SETTING: {
             std::map<uint32_t, uint64_t> changes{{uint32_t(cmd.a), uint64_t(cmd.b)}};
-            changeSettings(changes, glance::BrightnessRange(), "Setting " + String(cmd.a));
+            changeSettings(changes, glance::BrightnessRange(), cmd.a == 15 ? (cmd.b == 0 ? "Clock built-in hourly chime off" : "Clock built-in hourly chime sound " + String(cmd.b)) : "Setting " + String(cmd.a));
+            break;
+        }
+        case CMD_NIGHT: {
+            // a = 1 (DND) or 14 (Silent), b = mode 0 Off / 1 Scheduled / 2 Always, c = from * 100 + till
+            const int kind = cmd.a, mode = cmd.b, from = cmd.c / 100, till = cmd.c % 100;
+            const String what = String(kind == glance::DND_SCHEDULE ? "Do Not Disturb" : "Silent hours") + ": " +
+                (mode == 0 ? String("off") : mode == 2 ? String("always on") : String(from) + ":00–" + String(till) + ":00");
+            glance::Settings base;
+            if (!readSettings(base)) break;
+            Bytes command;
+            if (!glance::patchSchedule(base, kind, mode, from, till, command)) { logEvent(what + ": not changed (invalid value or unreadable clock schedule)", true); break; }
+            if (!writeControl(command, what)) break;
+            glance::Settings updated;
+            if (!readSettings(updated)) { logEvent(what + ": sent, but verification read failed", true); break; }
+            if (glance::scheduleMatches(updated, kind, mode, from, till)) logEvent(what + " — confirmed by the clock");
+            else logEvent(what + ": accepted, but the clock did not return the requested schedule", true);
+            if (linkUp()) readHandState();   // DND state bit changes immediately
             break;
         }
         case CMD_RANGE: {
@@ -763,6 +968,7 @@ void handleCommand(const Command& cmd) {
             bool homing;
             { Lock l; homing = st.hand.homing; }
             if (homing) { logEvent("The hands are already moving", true); break; }
+            suspendComet();
             if (writeControl(Bytes(glance::kStartCalibration, glance::kStartCalibration + 1), "Start calibration")) {
                 { Lock l; st.calibrationRequested = true; }
                 logEvent("Calibration started. Confirm only when both hands point exactly to 12.");
@@ -773,6 +979,7 @@ void handleCommand(const Command& cmd) {
             bool homing;
             { Lock l; homing = st.hand.homing; }
             if (homing) { logEvent("Wait for the hands to stop before confirming", true); break; }
+            suspendComet(10000);
             if (writeControl(Bytes(glance::kConfirmCalibration, glance::kConfirmCalibration + 1), "Confirm calibration")) {
                 { Lock l; st.calibrationRequested = false; }
                 logEvent("Hand position confirmed");
@@ -796,14 +1003,25 @@ void handleCommand(const Command& cmd) {
             break;
         }
         case CMD_ALARM_STOP:
+            suspendComet(2000);
             if (writeControl(Bytes(glance::kAlarmStop, glance::kAlarmStop + 4), "Stop alarm")) logEvent("Alarm stopped");
             break;
         case CMD_REFRESH: {
             glance::Settings s;
             if (readSettings(s)) logEvent("Settings refreshed");
             readBattery();
+            readHandState();
             break;
         }
+        case CMD_COMET:
+            suspendComet();
+            { Lock l; cfg.cometOn = cmd.a != 0; cfg.cometColor = cmd.b; cfg.cometRings = cmd.c; }
+            cometFailed = false; cometNextStep = -1;
+            saveConfig();
+            if (linkUp()) readHandState();
+            if (!cfg.cometOn) wxSendRequested = true;
+            logEvent(cfg.cometOn ? "Seconds enabled, colour " + String(cmd.b) + ", LEDs " + String(cmd.c) : "Seconds comet off; restoring weather");
+            break;
     }
     { Lock l; st.busy = false; }
 }
@@ -816,7 +1034,7 @@ void clockTask(void*) {
     if (cfg.paired()) setClock(ClockState::Waiting, "Waiting for Wi-Fi and internet time…");
     for (;;) {
         Command cmd;
-        if (xQueueReceive(commandQueue, &cmd, pdMS_TO_TICKS(200)) == pdTRUE) handleCommand(cmd);
+        if (xQueueReceive(commandQueue, &cmd, pdMS_TO_TICKS(cfg.cometOn ? 50 : 200)) == pdTRUE) handleCommand(cmd);
 
         // A late disconnect notice from a link we already replaced (sync/pair
         // reconnects) must not clear the new link's handles.
@@ -870,6 +1088,7 @@ void clockTask(void*) {
                     if (twelve) snprintf(text, sizeof text, "%d%s", l.tm_hour % 12 ? l.tm_hour % 12 : 12, l.tm_hour < 12 ? "AM" : "PM");
                     else snprintf(text, sizeof text, "%02d:00", l.tm_hour);
                     Bytes chime;
+                    suspendComet(90000);
                     if (glance::notice(text, 0, cfg.chimeSound, 12, chime) && writeControl(chime, "Hourly chime")) logEvent(String("Hourly chime ") + text);
                 }
             }
@@ -878,7 +1097,7 @@ void clockTask(void*) {
         static uint32_t wxNextSwap = 0;
         bool alternating;
         { Lock l; alternating = cfg.wxOn && cfg.wxRainMode == 1 && cfg.wxTemp && st.wxRainDue; }
-        if (alternating && linkUp() && !wxSendRequested && int32_t(millis() - wxNextSwap) >= 0 && uxQueueMessagesWaiting(commandQueue) == 0) {
+        if (!cfg.cometOn && alternating && linkUp() && !wxSendRequested && int32_t(millis() - wxNextSwap) >= 0 && uxQueueMessagesWaiting(commandQueue) == 0) {
             wxPhaseRain = !wxPhaseRain;
             wxNextSwap = millis() + uint32_t(cfg.wxCycle) * 1000;
             sendWeather(false);
@@ -890,6 +1109,11 @@ void clockTask(void*) {
             { Lock l; st.busy = true; }
             sendWeather(user);
             { Lock l; st.busy = false; }
+        }
+        if (uxQueueMessagesWaiting(commandQueue) == 0) {
+            // Background animation must not advertise user-command busy and
+            // disable the whole webpage until its next status poll.
+            updateComet();
         }
         if (millis() - lastMinuteCheck > 20000) {
             lastMinuteCheck = millis();
@@ -1089,6 +1313,8 @@ void handleStatus() {
     j += ",\"connected\":" + String(b(st.clock == ClockState::Connected)) + ",\"battery\":" + String(st.battery) + ",\"busy\":" + b(st.busy);
     j += ",\"auto\":" + String(b(cfg.autoConnect)) + ",\"suspended\":" + b(userSuspended) + ",\"announce\":" + b(cfg.announce);
     j += ",\"chime\":{\"on\":" + String(b(cfg.chimeOn)) + ",\"sound\":" + String(cfg.chimeSound) + ",\"quietFrom\":" + String(cfg.quietFrom) + ",\"quietTo\":" + String(cfg.quietTo) + "}";
+    // Fixed true is retained only for older cached clients; no editable option.
+    j += ",\"comet\":{\"on\":" + String(b(cfg.cometOn)) + ",\"color\":" + String(cfg.cometColor) + ",\"rings\":" + String(cfg.cometRings) + ",\"sceneSteps\":[" + sceneStepsJson() + "],\"respectDnd\":true,\"dndActive\":" + b(st.hand.valid && st.hand.dnd) + ",\"stateFresh\":" + b(comet::stateFresh(st.hand.valid, millis(), st.handUpdated)) + ",\"running\":" + b(st.cometRunning) + ",\"status\":" + q(st.cometText) + "}";
     j += ",\"alarmsPending\":" + String(b(cfg.alarmsPending)) + ",\"alarms\":[";
     for (size_t i = 0; i < cfg.alarms.size(); i++) {
         const auto& a = cfg.alarms[i];
@@ -1105,10 +1331,16 @@ void handleStatus() {
         const auto& s = st.settings;
         j += ",\"settings\":{\"brightness\":" + String(s.brightness) + ",\"autoLow\":" + String(s.autoLow) + ",\"autoHigh\":" + String(s.autoHigh);
         j += ",\"nightMode\":" + String(b(s.nightMode)) + ",\"digitalTime\":" + b(s.digitalTime) + ",\"twelveHour\":" + b(s.twelveHour);
-        j += ",\"hourPoints\":" + String(b(s.hourPoints)) + ",\"muted\":" + b(s.muted) + ",\"dateFormat\":" + String(s.dateFormat) + "}";
+        j += ",\"hourPoints\":" + String(b(s.hourPoints)) + ",\"muted\":" + b(s.muted) + ",\"dateFormat\":" + String(s.dateFormat);
+        j += ",\"builtInChimeSound\":" + String(s.builtInChimeSound);
+        auto sched = [](const glance::Settings::Schedule& x) {
+            return String("{\"known\":") + (x.known ? "true" : "false") + ",\"mode\":" + String(x.mode) +
+                   ",\"from\":" + String(x.from) + ",\"till\":" + String(x.till) + "}";
+        };
+        j += ",\"dnd\":" + sched(s.dnd) + ",\"silent\":" + sched(s.silent) + "}";
     } else j += ",\"settings\":null";
     j += ",\"hand\":{\"valid\":" + String(b(st.hand.valid)) + ",\"homing\":" + b(st.hand.homing) + ",\"awaiting\":" + b(st.hand.awaitingConfirmation);
-    j += ",\"homingFailure\":" + String(b(st.hand.homingFailure)) + ",\"motorFailure\":" + b(st.hand.motorFailure) + ",\"bits\":" + String(st.hand.bits) + "}}";
+    j += ",\"homingFailure\":" + String(b(st.hand.homingFailure)) + ",\"motorFailure\":" + b(st.hand.motorFailure) + ",\"timeAdjusting\":" + b(st.hand.timeAdjusting) + ",\"bits\":" + String(st.hand.bits) + "}}";
     {
         j += ",\"weather\":{\"on\":" + String(b(cfg.wxOn)) + ",\"place\":" + q(cfg.wxPlace) + ",\"lat\":" + q(cfg.wxLat) + ",\"lon\":" + q(cfg.wxLon);
         j += ",\"temp\":" + String(b(cfg.wxTemp)) + ",\"rainMode\":" + String(cfg.wxRainMode) + ",\"text\":" + b(cfg.wxText) + ",\"cycle\":" + String(cfg.wxCycle) +
@@ -1345,7 +1577,7 @@ void setupWeb() {
     server.on("/api/setting", HTTP_POST, [] {
         if (!clockReady()) return fail("Connect the clock first");
         int field = argInt("field"), value = argInt("value");
-        if (!glance::isEditableField(field) || value < 0 || value > 255 || (field == 5 && value > 4) || (field != 10 && field != 5 && value > 1))
+        if (value < 0 || !glance::validSettingValue(field, uint64_t(value)))
             return fail("Invalid setting");
         queued(enqueue(CMD_SETTING, field, value), "Updating…");
     });
@@ -1373,6 +1605,26 @@ void setupWeb() {
         if (server.hasArg("announce")) cfg.announce = server.arg("announce") == "1";
         saveConfig();
         ok("Saved");
+    });
+    server.on("/api/comet", HTTP_POST, [] {
+        int on = argInt("on"), color = argInt("color");
+        if (!comet::validOptions(on, color)) return fail("Choose On or Off and a supported comet colour");
+        // Older cached pages don't send `rings`: keep the saved choice rather than resetting it.
+        int rings = server.hasArg("rings") ? argInt("rings", -1) : cfg.cometRings;
+        if (!comet::validRings(rings)) return fail("Choose at least one of the four seconds LEDs");
+        bool legacy = server.hasArg("respectDnd");
+        if (legacy && !comet::validLegacyDndOption(argInt("respectDnd", -2)))
+            return fail("Invalid legacy DND value; seconds always follow clock Do Not Disturb");
+        queued(enqueue(CMD_COMET, on, color, rings), legacy ? "Saving seconds; Do Not Disturb is always respected" : "Saving seconds comet…");
+    });
+    server.on("/api/night", HTTP_POST, [] {
+        if (!clockReady()) return fail("Connect the clock first");
+        String which = server.arg("which");
+        int kind = which == "dnd" ? glance::DND_SCHEDULE : which == "silent" ? glance::SILENT_SCHEDULE : 0;
+        int mode = argInt("mode", -1), from = argInt("from", -1), till = argInt("till", -1);
+        if (!glance::validSchedule(kind, mode, from, till))
+            return fail("Choose Off, Scheduled or Always, and hours 0–23 (start and end must differ)");
+        queued(enqueue(CMD_NIGHT, kind, mode, from * 100 + till), "Updating the clock's night settings…");
     });
     server.on("/api/timezone", HTTP_POST, [] {
         String tz = server.arg("tz");

@@ -136,10 +136,58 @@ struct Settings {
     bool nightMode = false, digitalTime = false, twelveHour = false;
     bool hourPoints = false, muted = false;
     int dateFormat = 0;
+    uint64_t builtInChimeSound = 0; // field 15 charmSound; 0 = Off, 1–17 = Sound enum
+    // 1.22 night schedules. Firmware 1.6.7 (0x1F982 DND / 0x1FA02 Silent):
+    // permanent flag -> always; else `recurring` -> active while from <= hour < till
+    // (wrapping past midnight); recurring false -> off (compared against an absolute
+    // timestamp, so plain hours never match).
+    struct Schedule {
+        bool known = false;   // false when the clock's field is malformed: refuse editing
+        int mode = 0;         // 0 Off, 1 Scheduled, 2 Always
+        int from = 22, till = 8;  // original app defaults when the clock has none
+    };
+    Schedule dnd;     // field 1 {recurring, fromHour, tillHour} + field 3 permanentDND
+    Schedule silent;  // field 14 {recurring, fromHour, tillHour} + field 4 permanentMute
 };
+enum ScheduleKind { DND_SCHEDULE = 1, SILENT_SCHEDULE = 14 };
+inline uint32_t permanentFieldFor(int kind) { return kind == DND_SCHEDULE ? 3 : 4; }
+inline bool validSchedule(int kind, int mode, int from, int till) {
+    return (kind == DND_SCHEDULE || kind == SILENT_SCHEDULE) && mode >= 0 && mode <= 2 &&
+           from >= 0 && from <= 23 && till >= 0 && till <= 23 && (mode != 1 || from != till);
+}
+// Reads one schedule from a parsed Settings message.
+inline Settings::Schedule readSchedule(const WireMessage& m, int kind) {
+    Settings::Schedule out;
+    bool always = m.integerOr(permanentFieldFor(kind), 0) != 0;
+    bool recurring = false, malformed = false;
+    for (const auto& f : m.fields) {
+        if (f.number != uint32_t(kind)) continue;
+        WireMessage inner;
+        size_t i = f.start;
+        while (i < f.end && (m.raw[i] & 0x80)) ++i;   // key
+        ++i;
+        while (i < f.end && (m.raw[i] & 0x80)) ++i;   // length
+        ++i;
+        if (f.wireType != 2 || i > f.end || !inner.parse(Bytes(m.raw.begin() + i, m.raw.begin() + f.end))) { malformed = true; continue; }
+        recurring = inner.integerOr(1, 0) != 0;
+        uint64_t from = inner.integerOr(2, uint64_t(out.from)), till = inner.integerOr(3, uint64_t(out.till));
+        if (from > 23 || till > 23) { malformed = true; continue; }
+        out.from = int(from); out.till = int(till);
+    }
+    out.known = !malformed;
+    out.mode = always ? 2 : recurring ? 1 : 0;
+    return out;
+}
 
 inline bool isEditableField(uint32_t f) {
-    return f == 2 || f == 4 || f == 5 || f == 9 || f == 10 || f == 11 || f == 12;
+    return f == 2 || f == 4 || f == 5 || f == 9 || f == 10 || f == 11 || f == 12 || f == 15;
+}
+inline bool validSettingValue(uint32_t field, uint64_t value) {
+    if (!isEditableField(field)) return false;
+    if (field == 10) return value <= 255;
+    if (field == 5) return value <= 4;
+    if (field == 15) return value <= 17;
+    return value <= 1;
 }
 
 inline bool parseSettings(const Bytes& data, Settings& s) {
@@ -160,6 +208,7 @@ inline bool parseSettings(const Bytes& data, Settings& s) {
     }
     if (recognised < 3) return false;
     if (m.integerOr(5, 0) > 4) return false;
+    for (const auto& f : m.fields) if (f.number == 15 && f.wireType != 0) return false;
     s.raw = payload;
     s.brightnessRaw = m.integerOr(10, 0);
     s.brightness = int(s.brightnessRaw & 255);
@@ -171,6 +220,9 @@ inline bool parseSettings(const Bytes& data, Settings& s) {
     s.hourPoints = m.integerOr(9, 0) != 0;
     s.digitalTime = m.integerOr(11, 0) != 0;
     s.twelveHour = m.integerOr(12, 0) != 0;
+    s.builtInChimeSound = m.integerOr(15, 0);
+    s.dnd = readSchedule(m, DND_SCHEDULE);
+    s.silent = readSchedule(m, SILENT_SCHEDULE);
     s.valid = true;
     return true;
 }
@@ -193,10 +245,7 @@ inline bool patchSettings(const Settings& base, const std::map<uint32_t, uint64_
     if (changes.empty() && !range.present) return false;
     if (range.present && (changes.count(10) || !validRange(range.low, range.high))) return false;
     for (const auto& c : changes) {
-        if (!isEditableField(c.first)) return false;
-        if (c.first == 10) { if (c.second > 255) return false; }
-        else if (c.first == 5) { if (c.second > 4) return false; }
-        else if (c.second > 1) return false;
+        if (!validSettingValue(c.first, c.second)) return false;
     }
     WireMessage m;
     if (!m.parse(base.raw)) return false;
@@ -208,6 +257,42 @@ inline bool patchSettings(const Settings& base, const std::map<uint32_t, uint64_
     Bytes body = m.replacingIntegers(merged);
     command.insert(command.end(), body.begin(), body.end());
     return true;
+}
+
+// Builds a Settings write changing ONE night schedule: its sub-message (all three
+// required fields, as the firmware's nanopb table demands) and its permanent flag.
+// Every other field, known or unknown, is resent byte-for-byte.
+inline bool patchSchedule(const Settings& base, int kind, int mode, int from, int till, Bytes& command) {
+    if (!base.valid || !validSchedule(kind, mode, from, till)) return false;
+    if (!(kind == DND_SCHEDULE ? base.dnd.known : base.silent.known)) return false;
+    WireMessage m;
+    if (!m.parse(base.raw)) return false;
+    Bytes inner;
+    putInteger(inner, 1, mode == 1 ? 1 : 0);
+    putInteger(inner, 2, uint64_t(from));
+    putInteger(inner, 3, uint64_t(till));
+    const uint32_t flag = permanentFieldFor(kind);
+    Bytes body;
+    bool wroteSchedule = false, wroteFlag = false;
+    for (const auto& f : m.fields) {
+        if (f.number == uint32_t(kind)) {
+            if (!wroteSchedule) { putBytes(body, uint32_t(kind), inner); wroteSchedule = true; }
+        } else if (f.number == flag) {
+            if (!wroteFlag) { putInteger(body, flag, mode == 2 ? 1 : 0); wroteFlag = true; }
+        } else {
+            body.insert(body.end(), m.raw.begin() + f.start, m.raw.begin() + f.end);
+        }
+    }
+    if (!wroteSchedule) putBytes(body, uint32_t(kind), inner);
+    if (!wroteFlag) putInteger(body, flag, mode == 2 ? 1 : 0);
+    command = {5, 0, 0, 0};
+    command.insert(command.end(), body.begin(), body.end());
+    return true;
+}
+inline bool scheduleMatches(const Settings& s, int kind, int mode, int from, int till) {
+    if (!s.valid) return false;
+    const Settings::Schedule& x = kind == DND_SCHEDULE ? s.dnd : s.silent;
+    return x.known && x.mode == mode && x.from == from && x.till == till;
 }
 
 inline bool settingsMatch(const Settings& s, const std::map<uint32_t, uint64_t>& changes, const BrightnessRange& range) {
@@ -312,6 +397,7 @@ struct HandState {
     bool valid = false;
     uint16_t bits = 0;
     bool homing = false, awaitingConfirmation = false, homingFailure = false, motorFailure = false;
+    bool timeAdjusting = false, dnd = false;
 };
 inline HandState decodeHandState(const uint8_t* data, size_t len) {
     HandState h;
@@ -321,6 +407,8 @@ inline HandState decodeHandState(const uint8_t* data, size_t len) {
     h.awaitingConfirmation = h.bits & 1024;
     h.homingFailure = h.bits & 64;
     h.motorFailure = h.bits & 2048;
+    h.timeAdjusting = h.bits & 256;
+    h.dnd = h.bits & 16;
     h.valid = true;
     return h;
 }

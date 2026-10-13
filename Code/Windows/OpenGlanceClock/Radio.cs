@@ -19,6 +19,9 @@ public interface IClockLink : IDisposable
     Task<byte[]> ReadControlAsync();
     Task WriteControlAsync(byte[] data);
     Task<byte[]?> ReadStateAsync();
+    /// The clock's active face (5075ffac, one byte); null when the clock has no such characteristic.
+    Task<byte[]?> ReadSceneAsync();
+    bool CanReadScene { get; }
     Task<int?> ReadBatteryAsync();
     Task<string?> ReadFirmwareAsync();
     event Action<byte[]>? StateChanged;
@@ -117,7 +120,7 @@ sealed class WinLink : IClockLink
     readonly Windows.Devices.Bluetooth.BluetoothLEDevice device;
     readonly Windows.Devices.Bluetooth.GenericAttributeProfile.GattSession session;
     readonly List<IDisposable> services = new();
-    Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristic? control, state, battery, firmware;
+    Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristic? control, state, scene, battery, firmware;
     public event Action<byte[]>? StateChanged;
     public event Action? Disconnected;
     public string Name => string.IsNullOrEmpty(device.Name) ? "Glance Clock" : device.Name;
@@ -155,6 +158,8 @@ sealed class WinLink : IClockLink
         {
             var st = await gs.GetCharacteristicsForUuidAsync(Guid.Parse(GlanceProtocol.GlanceCommands.StateUuid), Windows.Devices.Bluetooth.BluetoothCacheMode.Uncached).AsTask(cancel);
             if (st.Status == Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success && st.Characteristics.Count > 0) state = st.Characteristics[0];
+            var sc = await gs.GetCharacteristicsForUuidAsync(Guid.Parse(GlanceProtocol.GlanceCommands.SceneUuid), Windows.Devices.Bluetooth.BluetoothCacheMode.Uncached).AsTask(cancel);
+            if (sc.Status == Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success && sc.Characteristics.Count > 0) scene = sc.Characteristics[0];
         }
         battery = await Find(Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceUuids.Battery, Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicUuids.BatteryLevel, cancel);
         firmware = await Find(Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceUuids.DeviceInformation, Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicUuids.FirmwareRevisionString, cancel);
@@ -195,6 +200,8 @@ sealed class WinLink : IClockLink
     }
 
     public async Task<byte[]?> ReadStateAsync() => state is null ? null : await Read(state);
+    public bool CanReadScene => scene is not null && scene.CharacteristicProperties.HasFlag(Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicProperties.Read);
+    public async Task<byte[]?> ReadSceneAsync() => CanReadScene ? await Read(scene!) : null;
 
     public async Task<int?> ReadBatteryAsync()
     {

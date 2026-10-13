@@ -22,18 +22,128 @@ The bridge replaces the Mac app. It is the only device that talks to the Glance 
 - The clock reads the time each time the bridge connects. The page shows **Last time read** and the exact value supplied.
 - **Sync time now** reconnects so the clock reads the time again. The bridge also does this daily at 03:05 and whenever the UTC offset changes (daylight saving starts or ends).
 - Until internet time arrives, the bridge reports "time unknown" (year 0) rather than a wrong time.
-- A manual date and time can be set from the page. It pauses internet time until restart or **Back to internet time**.
+- A manual date and time can be set from the page. It pauses internet time until restart or **Use internet time** on Home.
+- All time controls are now on **Home**. **Use internet time** is always visible;
+  to use manual time, fill Date/Time and press **Apply manual time**. The active
+  source is labelled separately, so editing the fields alone never switches it.
+  Time zone, daily correction and **Update clock now** are also on Home.
 
 ## Web page
 Tabs:
-- **Home:** clock status, time, weather summary and recent activity.
-- **Messages:** messages and timer.
+- **Home:** visible Internet/Manual time controls, time zone, clock status, weather summary and recent activity.
+- **Alerts:** messages, timer and hourly-chime controls. Old `#message` bookmarks redirect to `#alerts`.
+- **Alarms:** saved alarms and their schedules.
 - **Weather**
-- **Display:** display toggles and brightness.
-- **Clock:** pairing, connection options and hand calibration.
-- **System:** time zone and manual time, firmware, Wi-Fi and the full activity log.
+- **Display:** display toggles, brightness and the comet seconds hand.
+- **Clock:** pairing and hand calibration.
+- **System:** Connection controls/options, firmware, Wi-Fi and the full activity log.
+
+### Page updates (Bridge 1.17)
+
+The page reads cached bridge status, not fresh Bluetooth data. It now checks
+every 8 seconds when the comet is enabled, 5 seconds otherwise, and 1.5 seconds
+while searching/pairing. Automatic checks stop when the page is hidden and
+resume when it returns. Commands get a prompt status check, and overlapping
+status requests are prevented. The displayed time ticks locally once per second
+between checks; this does not make a network request.
+
+Background Bluetooth activity no longer greys out every connected-clock
+control until the next 8-second check. Commands still run one at a time on the
+bridge. Seconds options keep your chosen switch/colour values while they are
+being saved; temporary faster checks stop after acknowledgement or timeout.
+
+Up to 1.18 the comet replaced its scene about every 2.5 seconds. Each replacement
+makes the stock firmware restart the scene (frame counter, ring framebuffer and
+the display's time/date cycle; static analysis of firmware 1.6.7). That caused the
+tail glitches and the time/date swapping about every 3 seconds. **1.19 replaces
+the scene only about every 10 seconds** (see below).
+
+## Seconds pixel (Bridge 1.21)
+
+On **Display → Comet seconds hand**, enable the switch and choose a colour.
+Under **LEDs that light**, click any of the four LEDs at each position, from the
+outer ring (1) to the centre (4); at least one stays on. Any unbroken run keeps
+a new clock scene about every 10 s. A gap (for example outer + centre) needs two
+drawing segments per tick, so the scene changes about every 7.5 s; the page shows
+the interval for your choice. Outer only behaves exactly like 1.20.
+The 24 named colours are the clock's native palette, not arbitrary RGB values.
+Turquoise is the default. The switch and colour are saved on the bridge and the
+animation continues when the webpage is closed, while the bridge is connected.
+Off restores your existing weather-ring configuration. Weather data continues
+updating while the comet uses the ring; no weather preferences are erased.
+
+Seconds **always pause during the clock's Do Not Disturb**. The ineffective
+Respect Do Not Disturb switch was removed at the owner's request in 1.18;
+1.17's override had been confirmed not to show the physical ring. Old saved
+override choices are ignored. Older cached clients can submit a valid legacy
+option, but it never bypasses DND; status always reports respectDnd=true for
+compatibility. Retry does not override DND.
+
+Timers, alarms, messages, calibration and Bluetooth-error guards remain active.
+The card reports the clock's actual DND state separately from automatic night
+mode. Clock-wide DND, night mode, Mute and time settings are not changed by this
+update. Changing the clock to AM manually changes its actual time and may
+affect its scheduled alarms; it is not a seconds-only DND override.
+
+This is an **experimental hardware-test build**, initially Off. It sends ring-only
+CustomScene scenes in the same scene slot as weather: one clockwise lap per minute
+across the outer ring's 48 positions. **Since 1.20** the seconds are a **single
+pixel** that ticks one position every 1.25 s. Each step is one Fill that paints
+the new pixel and paints the previous pixel black (the clock does not erase a
+Fill when its lifetime ends, which made 1.19's segment grow). About 17 bytes per
+step, so 8 steps (10 seconds) fit in one command; the clock refuses long
+(multi-packet) writes. Expected result: about 6 scene replacements per minute
+instead of 24, and time/date swapping about every 10 seconds. When seconds take
+over the ring, the bridge first deletes its own old weather scenes (slots 1 and 2)
+so the clock does not keep cycling a stale rain or temperature ring. MovingBar
+uses an ease-in/out curve and Wave a repeating pattern, so neither is a uniform
+seconds hand.
+Timing is aligned to bridge time, not physical clock-hand telemetry. The webpage
+preview is illustrative, not proof of the animation on the clock.
+
+Timers, actual calibration/homing or confirmation, DND, recognised active alert faces,
+saved alarm minutes and native hourly-chime minutes pause the comet. Messages
+and bridge chimes hold it for 90 seconds. It requires a readable active-face
+characteristic and stops on a Bluetooth error; **Retry / apply** explicitly
+starts a fresh attempt. It never sets global brightness, disables night mode,
+changes clock time/settings, clears all scene slots or uses the Timer command.
+Normal movement while setting the time is no longer incorrectly called hand
+calibration or used to pause the ring-only comet. State is read independently
+of webpage checks (every 2 seconds while state-blocked, 5 seconds otherwise);
+unavailable/stale state pauses safely rather than trusting an old notification.
+
+After installation, check the direction/position, that exactly one pixel is lit,
+any blip at each roughly 10-second handoff, how often time/date swap, that the old
+rain graph is gone, alerts, night mode and weather restoration.
+Version 1.13 was owner-confirmed to draw the seconds comet, but its periodic
+whole-ring clear erased the tail at handoffs. Version 1.14 clears only expired
+points during an adjacent-batch handoff and reapplies a fade to the existing
+tail without refilling it at full brightness. Taking over from weather or
+resynchronising after a missed batch still starts cleanly. Static inspection
+now confirms that the stock firmware clears its framebuffer on replacement,
+so the attempted tail preservation is insufficient. A proven continuous native
+seconds scene is impossible with stock firmware; 1.19 instead makes replacements rare.
+Disable the switch if the appearance isn't right and report what it does.
+Mac and Windows applications are unchanged, as requested.
 
 The address remembers the tab, for example `http://openglance.local/#weather`.
+
+## Night settings (Bridge 1.22)
+
+**Display → Night settings** shows and edits two schedules stored on the clock:
+
+- **Do Not Disturb** (Off / Scheduled from–to / Always). While it is active the
+  clock hides ring overlays: the seconds pixel, the weather ring and
+  notifications. The bridge cannot override this.
+- **Silent** (Off / Scheduled / Always) only mutes sounds, so the seconds stay
+  visible. Silent "Always" is the same setting as **Mute sounds**.
+
+For quiet nights with the seconds still ticking, set Do Not Disturb to Off (or
+shorten it) and schedule Silent for the same hours. Each change reads the
+clock's settings first, replaces only that schedule (every other setting and
+unknown field is kept byte for byte), then reads back and logs whether the
+clock confirmed it. Off keeps the saved hours, so switching back to Scheduled
+restores them.
 
 ## Weather ring
 - **Location:** search for a town on the Weather tab. The search runs from your browser via Open-Meteo's geocoding.
@@ -55,10 +165,27 @@ The address remembers the tab, for example `http://openglance.local/#weather`.
 ## Hourly chime and sounds
 - **Hourly chime (Messages tab):** on the hour, the bridge sends a short message showing the time ("14:00", or "2PM" when the clock is in 12-hour mode) with the chosen sound. There is no animation.
 - **Quiet hours:** default 22:00–07:00. Setting both to the same hour chimes around the clock.
-- **When it skips:** no chime while the hands are calibrating, while a timer is running, or for an hour that began before the bridge started. The clock's own night mode also mutes sounds.
+- **When it skips:** no chime during the bridge's configured quiet hours, while the hands are calibrating, while a timer is running, or for an hour that began before the bridge started. Automatic night mode, clock DND and clock Mute are separate settings; do not assume night mode or DND silences every native sound.
 - **Sounds:** all 17 sounds from the Glance protobuf schema are offered (Waves, Rise, Charging, Steps, Radar, Bells, Bye, Hello, Flowers, Circles, Complete, Popcorn, Break, Opening, High, Shine, Extension). Only Radar has been confirmed by the owner so far; each sound picker has a **Test** button that plays it once.
 
+### Battery / charging beeps
+
+The owner reports a periodic 100% notification during DND. The bridge only
+reads battery level; it does not send a battery message. Stock 1.6.7's battery
+notification routine checks the separate Mute state before playing sound 3
+(Charging), not the DND state. **Display → Mute sounds** is the existing way to
+test silencing this notification; no battery-only sound setting is verified.
+The original APK says timers and alarms remain audible when muted, but verify
+that behaviour on your clock before depending on it. The cause of repeated
+charge notifications (rather than one notification) is not yet established.
+
 ## Firmware updates
+### Clock's built-in hourly chime (1.11)
+
+On **Messages**, **Clock’s built-in hourly chime** controls the clock's saved `charmSound` (field 15), separately from the bridge chime. Choose **Off** to stop only this sound, or pick one of the 17 sounds. The current clock-read value is shown. Every edit reads fresh settings, changes only field 15, preserves all other fields including time offset 18, then reads back to verify. Unknown values are displayed rather than overwritten.
+
+It can play without the bridge connected; bridge quiet hours do not control it. Keep it Off when using the bridge chime to avoid doubles. Alarms, timers, messages and Mute are unchanged. Native silencing and power-cycle persistence await hardware testing. The owner chose to leave the 1.11 file ready, not install it yet.
+
 Each release is a single file in `Firmware/`: `OpenGlance Bridge X.YY OTA.bin`.
 - **Over Wi-Fi:** on the web page, open **Bridge firmware**, choose the OTA.bin and press **Install update**. Settings and the clock pairing are kept. Files that are not OpenGlance bridge firmware for the ESP32-C3 are rejected.
 - **Over USB (a bare board, or recovery):** open `MAC/OpenGlance Flasher X.YY.app`, choose the board's USB port (it usually appears as `usbmodem…`) and press **Install firmware**. It picks the newest OTA.bin from `Firmware/` automatically. The app carries the fixed bootloader, partition table and boot selector, and writes them together with the OTA.bin. That result is byte-identical to a full image. Settings are kept unless you tick **Erase the whole chip first**.

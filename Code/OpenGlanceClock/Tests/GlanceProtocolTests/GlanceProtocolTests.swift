@@ -49,6 +49,28 @@ final class GlanceProtocolTests {
         XCTAssertThrowsError(try ClockSettings(data: settings()).patched([10: 256]))
         XCTAssertEqual(try ClockSettings(data: Data([68,97,116,97,0]) + settings()).brightness, 128)
     }
+    func testBuiltInHourlyChime() throws {
+        let unknown = WireMessage.bytes(30, Data([0, 255, 8]))
+        let offset = UInt64(bitPattern: Int64(-62))
+        let original = try ClockSettings(data: settings(0xab1edc00) + WireMessage.integer(15, 6) + WireMessage.integer(18, offset) + unknown)
+        XCTAssertEqual(original.builtInChimeSound, 6)
+        for value: UInt64 in 0...17 {
+            let updated = try ClockSettings(data: Data(original.patched([15: value]).dropFirst(4)))
+            XCTAssertEqual(updated.builtInChimeSound, value)
+            XCTAssertEqual(updated.timeOffsetMinutes, -62)
+            XCTAssertEqual(try WireMessage(updated.raw).integer(10), 0xab1edc00)
+            XCTAssertTrue(updated.raw.suffix(unknown.count) == unknown)
+            XCTAssertTrue(updated.matches([15: value]))
+            XCTAssertEqual(updated.matches([15: (value + 1) % 18]), false)
+        }
+        XCTAssertThrowsError(try original.patched([15: 18]))
+        XCTAssertThrowsError(try original.patched([15: UInt64.max]))
+        XCTAssertEqual(try ClockSettings(data: settings()).builtInChimeSound, 0)
+        let future = try ClockSettings(data: settings() + WireMessage.integer(15, 99))
+        XCTAssertEqual(future.builtInChimeSound, 99)
+        XCTAssertEqual(try ClockSettings(data: Data(future.patched([2: 1]).dropFirst(4))).builtInChimeSound, 99)
+        XCTAssertThrowsError(try ClockSettings(data: settings() + WireMessage.bytes(15, Data([6]))))
+    }
     func testAutomaticBrightnessRangeFromOriginalApp() throws {
         let range = try AutomaticBrightnessRange(low: 30, high: 220)
         XCTAssertEqual(range.encoded, 2022400)
@@ -223,6 +245,73 @@ final class GlanceProtocolTests {
         XCTAssertEqual(ClockTimeCorrection.describe(2882), "forward 2 days 2 minutes")
     }
 
+    // Bridge 1.20–1.22 ports: byte-identical to the ESP32 C++ (golden vectors generated from comet.h / glance_protocol.h).
+    func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
+    func fnv(_ h: inout UInt64, _ d: Data) { for x in d { h ^= UInt64(x); h = h &* 1099511628211 }; h ^= 0xff; h = h &* 1099511628211 }
+    func testSecondsSceneMatchesBridge() throws {
+        let a = try XCTUnwrap(SecondsScene.scene(frame: 0, color: 18, continuation: false, rings: 1))
+        XCTAssertEqual(hex(a.data), "000008010a0a0802180132040880de030a0c08021801320608808048082f0a0e0802103f180132060881804808000a0e0802107d180132060882804808010a0f080210bc01180132060883804808020a0f080210fa01180132060884804808030a0f080210b902180132060885804808040a0f080210f702180132060886804808050a0f080210b60318013206088780480806")
+        XCTAssertEqual(a.endPixel, 8)
+        let b = try XCTUnwrap(SecondsScene.scene(frame: 1234, color: 5, continuation: true, rings: 9))
+        XCTAssertEqual(hex(b.data), "000008010a1308021801320d0893801408d38114081208d2010a15080210101801320d0894801408d48114081308d3010a150802104f1801320d0895801408d58114081408d4010a160802108d011801320d0896801408d68114081508d5010a16080210cc011801320d0897801408d78114081608d6010a160802108a021801320d0898801408d88114081708d701")
+        XCTAssertEqual(b.endPixel, 25)
+        let c = try XCTUnwrap(SecondsScene.scene(frame: 2990, color: 24, continuation: false, rings: 15))
+        XCTAssertEqual(hex(c.data), "000008010a0a0802180132040880de030a0e08021801320808af806308ae80030a100802100a180132080880806308af80030a10080210491801320808818063088080030a1108021087011801320808828063088180030a11080210c6011801320808838063088280030a1108021084021801320808848063088380030a11080210c302180132080885806308848003")
+        XCTAssertEqual(c.endPixel, 54)
+        var h: UInt64 = 1469598103934665603
+        for cont in [false, true] { for rings in 1...15 { for color in [1, 17, 24] {
+            var minimum = 99
+            for f in 0..<3000 {
+                let s = try XCTUnwrap(SecondsScene.scene(frame: f, color: color, continuation: cont, rings: rings))
+                XCTAssertTrue(s.data.count <= 155 && s.data.prefix(4) == Data([0, 0, 8, 1]))
+                if cont { minimum = min(minimum, s.endPixel - SecondsScene.pixelAt(frame: f)) }
+                fnv(&h, s.data); fnv(&h, Data([UInt8(s.endPixel)]))
+            }
+            if cont { XCTAssertEqual(minimum, SecondsScene.sceneSteps[rings]) }
+        } } }
+        XCTAssertEqual(String(format: "%016llx", h), "4a35df0c4ed39f83")
+        XCTAssertNil(SecondsScene.scene(frame: 3000, color: 18)); XCTAssertNil(SecondsScene.scene(frame: 0, color: 0))
+        XCTAssertNil(SecondsScene.scene(frame: 0, color: 18, rings: 0)); XCTAssertNil(SecondsScene.scene(frame: 0, color: 18, rings: 16))
+        XCTAssertTrue(SecondsScene.alertFace(2) && SecondsScene.alertFace(9) && !SecondsScene.alertFace(9 | 128) && !SecondsScene.alertFace(1))
+        XCTAssertEqual(SecondsScene.colours.count, 24); XCTAssertEqual(SecondsScene.colours[17].name, "Turquoise")
+        let state = try ClockHandState(data: Data([0x10, 0x62]))
+        XCTAssertTrue(state.doNotDisturb && !state.timeAdjusting && !state.homing && state.bits == 0x6210)
+        XCTAssertTrue(try ClockHandState(data: Data([0x14, 0x63])).timeAdjusting)
+    }
+    func testNightSchedulesMatchBridge() throws {
+        let base = WireMessage.integer(2, 0) + WireMessage.integer(4, 1) + WireMessage.integer(10, 128)
+            + WireMessage.bytes(1, WireMessage.integer(1, 1) + WireMessage.integer(2, 22) + WireMessage.integer(3, 8))
+            + WireMessage.integer(15, 6) + WireMessage.integer(18, UInt64(bitPattern: -90)) + WireMessage.bytes(30, Data([7, 7]))
+        XCTAssertEqual(hex(base), "100020015080010a0608011016180878069001a6ffffffffffffffff01f201020707")
+        let s = try ClockSettings(data: base)
+        XCTAssertEqual(s.doNotDisturb, ClockSchedule(mode: 1, from: 22, till: 8))
+        XCTAssertEqual(s.silent.mode, 2)   // permanentMute (field 4) = Silent Always
+        XCTAssertEqual(hex(try s.patched(schedule: .doNotDisturb, mode: 0, from: 22, till: 8)), "05000000100020015080010a0608001016180878069001a6ffffffffffffffff01f2010207071800")
+        XCTAssertEqual(hex(try s.patched(schedule: .silent, mode: 1, from: 22, till: 7)), "05000000100020005080010a0608011016180878069001a6ffffffffffffffff01f2010207077206080110161807")
+        XCTAssertEqual(hex(try s.patched(schedule: .doNotDisturb, mode: 2, from: 21, till: 6)), "05000000100020015080010a0608001015180678069001a6ffffffffffffffff01f2010207071801")
+        var h: UInt64 = 1469598103934665603, accepted = 0
+        for kind in ClockSchedule.Kind.allCases { for mode in 0...2 { for f in 0..<24 { for t in 0..<24 {
+            guard ClockSchedule.isValid(mode: mode, from: f, till: t) else { XCTAssertThrowsError(try s.patched(schedule: kind, mode: mode, from: f, till: t)); continue }
+            let cmd = try s.patched(schedule: kind, mode: mode, from: f, till: t)
+            fnv(&h, cmd); accepted += 1
+            let u = try ClockSettings(data: Data(cmd.dropFirst(4)))
+            XCTAssertTrue(u.matches(schedule: kind, mode: mode, from: f, till: t))
+            XCTAssertEqual(u.schedule(kind == .doNotDisturb ? .silent : .doNotDisturb), s.schedule(kind == .doNotDisturb ? .silent : .doNotDisturb))
+            XCTAssertEqual(u.timeOffsetMinutes, -90); XCTAssertEqual(u.builtInChimeSound, 6); XCTAssertEqual(u.brightness, 128)
+            if kind == .silent { XCTAssertEqual(u.muted, mode == 2) }
+        } } } }
+        XCTAssertEqual(accepted, 2 * 3 * 576 - 2 * 24)
+        XCTAssertEqual(String(format: "%016llx", h), "acc77cd884c5f1f3")
+        // Absent schedule: defaults 22–8 Off. Malformed: unreadable and not editable.
+        let plain = try ClockSettings(data: settings())
+        XCTAssertEqual(plain.doNotDisturb, ClockSchedule(mode: 0, from: 22, till: 8))
+        let bad = try ClockSettings(data: settings() + WireMessage.integer(1, 5))
+        XCTAssertEqual(bad.doNotDisturb.known, false)
+        XCTAssertThrowsError(try bad.patched(schedule: .doNotDisturb, mode: 1, from: 22, till: 8))
+        XCTAssertEqual(try ClockSettings(data: settings() + WireMessage.bytes(14, WireMessage.integer(2, 30))).silent.known, false)
+        for (m, f, t) in [(3, 1, 2), (1, 5, 5), (1, 24, 2), (1, -1, 2), (0, 1, 24)] { XCTAssertEqual(ClockSchedule.isValid(mode: m, from: f, till: t), false) }
+    }
+
 }
 
 @main enum ProtocolCheckRunner {
@@ -231,6 +320,7 @@ final class GlanceProtocolTests {
         checks.testDiscoveryDoesNotInventClockIdentity()
         try checks.testPreservesOpaqueBrightnessBitsAndUnknownFields()
         try checks.testSettingsValidation()
+        try checks.testBuiltInHourlyChime()
         try checks.testAutomaticBrightnessRangeFromOriginalApp()
         try checks.testNoticeGoldenPacket()
         try checks.testTimerDurationIsInInterval()
@@ -241,7 +331,9 @@ final class GlanceProtocolTests {
         try checks.testAlarmsFromOriginalApp()
         try checks.testWeatherScenesMatchBridge()
         try checks.testClockTimeOffsetFromFirmware167()
-        print("PASS: 13 check groups (discovery filtering, settings preservation, validation, automatic brightness range, notices, timers, malformed packets, time zones/DST, advancing manual time, hand-state decoding, alarms, weather scenes, clock time offset).")
+        try checks.testSecondsSceneMatchesBridge()
+        try checks.testNightSchedulesMatchBridge()
+        print("PASS: 16 check groups (discovery filtering, settings preservation, validation, automatic brightness range, notices, timers, malformed packets, time zones/DST, advancing manual time, hand-state decoding, alarms, weather scenes, clock time offset, built-in hourly chime, seconds scenes, night schedules).")
     }
 }
 

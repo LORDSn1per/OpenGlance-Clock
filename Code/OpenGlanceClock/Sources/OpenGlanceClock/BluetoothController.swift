@@ -45,14 +45,24 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
     @Published var autoConnect = UserDefaults.standard.object(forKey: "autoConnect") as? Bool ?? true {
         didSet { UserDefaults.standard.set(autoConnect, forKey: "autoConnect"); if !autoConnect { retryTimer?.invalidate() } }
     }
+    /// Latest hand/state flags (5075fc78) and when they were read or notified.
+    @Published var handState: ClockHandState?
+    @Published var handStateUpdated: Date?
+    var doNotDisturbActive: Bool { handState?.doNotDisturb ?? false }
     /// Called each time the clock connects and its settings have been read.
     var onClockReady: [() -> Void] = []
+    /// Called before a command that takes over the display (message, timer, calibration…), with the
+    /// seconds of quiet it needs, so the seconds pixel can step aside first (as the bridge does).
+    var onDisplayCommand: [(TimeInterval) -> Void] = []
 
     private var central: CBCentralManager?
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var active: CBPeripheral?
     private var control: CBCharacteristic?
     private var stateCharacteristic: CBCharacteristic?
+    private var sceneCharacteristic: CBCharacteristic?
+    private static let stateUUID = CBUUID(string: "5075fc78-1e0e-11e7-93ae-92361f002671")
+    private static let sceneUUID = CBUUID(string: "5075ffac-1e0e-11e7-93ae-92361f002671")
     private var scanRequested = false
     private var scanTimer: Timer?
     private var connectTimer: Timer?
@@ -114,7 +124,7 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         nearby = []
         if enabled {
             clockName = "Studio clock"
-            settings = try? ClockSettings(data: Data([16, 1, 32, 0, 40, 1, 72, 1, 80, 128, 1, 88, 1, 96, 0]))
+            settings = try? ClockSettings(data: Data([16, 1, 32, 0, 40, 1, 72, 1, 80, 128, 1, 88, 1, 96, 0, 10, 6, 8, 1, 16, 22, 24, 7]))   // DND 22–07
             battery = 84
             firmwareVersion = "1.6.7"
             status = "Demo mode · no Bluetooth commands"
@@ -191,7 +201,8 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         connectWhenFound = false
         stopScan(); connectTimer?.invalidate(); operationTimer?.invalidate()
         isConnecting = false; isConnected = false; settings = nil; control = nil; battery = nil; firmwareVersion = nil
-        needsCalibrationConfirmation = false; isCalibrating = false; stateCharacteristic = nil; handStatus = "Hand position not read"
+        needsCalibrationConfirmation = false; isCalibrating = false; stateCharacteristic = nil; sceneCharacteristic = nil; handStatus = "Hand position not read"
+        handState = nil; handStateUpdated = nil
         let pending = operations + (currentOperation.map { [$0] } ?? [])
         operations = []; currentOperation = nil; isBusy = false
         if let active { central?.cancelPeripheralConnection(active) }
@@ -254,7 +265,7 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         for service in services {
             let uuids = service.uuid == CBUUID(string: "180F") ? [CBUUID(string: "2A19")]
                 : service.uuid == CBUUID(string: "180A") ? [CBUUID(string: "2A26")]
-                : [CBUUID(string: GlanceCommands.controlUUID), CBUUID(string: "5075fc78-1e0e-11e7-93ae-92361f002671")]
+                : [CBUUID(string: GlanceCommands.controlUUID), Self.stateUUID, Self.sceneUUID]
             peripheral.discoverCharacteristics(uuids, for: service)
         }
     }
@@ -284,7 +295,9 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
                         ? "Time correction from this Mac is available (firmware 1.6.7 or later)."
                         : "Time correction from this Mac needs firmware 1.6.7 or later.")
                 }
-            } else if characteristic.uuid == CBUUID(string: "5075fc78-1e0e-11e7-93ae-92361f002671") {
+            } else if characteristic.uuid == Self.sceneUUID {
+                sceneCharacteristic = characteristic
+            } else if characteristic.uuid == Self.stateUUID {
                 stateCharacteristic = characteristic
                 if characteristic.properties.contains(.notify) { peripheral.setNotifyValue(true, for: characteristic) }
                 if characteristic.properties.contains(.read) {
@@ -327,6 +340,60 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         do { changeSettings([:], automaticRange: try AutomaticBrightnessRange(low: low, high: high)) }
         catch { fail("Brightness limits must be 0–255, with minimum no higher than maximum.") }
     }
+    /// Writes one night schedule (Do Not Disturb or Silent): fresh read, replace only that schedule and its
+    /// permanent flag, write, read back and verify. Same bytes as the bridge's /api/night.
+    func setSchedule(_ kind: ClockSchedule.Kind, mode: Int, from: Int, till: Int) {
+        guard canControl else { return }
+        let name = kind == .doNotDisturb ? "Do Not Disturb" : "Silent hours"
+        let what = "\(name): " + (mode == 0 ? "off" : mode == 2 ? "always on" : String(format: "%02d:00–%02d:00", from, till))
+        guard ClockSchedule.isValid(mode: mode, from: from, till: till) else { fail("Choose Off, Scheduled or Always, and different start and end hours."); return }
+        if demoMode {
+            do { if let settings { self.settings = try ClockSettings(data: Data(settings.patched(schedule: kind, mode: mode, from: from, till: till).dropFirst(4))) }; log("Demo · \(what.lowercased())", "No Bluetooth command was sent.") }
+            catch { fail(error.localizedDescription) }
+            return
+        }
+        guard let control else { return }; isBusy = true
+        readSettings(control) { [weak self] result in
+            guard let self else { return }
+            do {
+                let command = try result.get().patched(schedule: kind, mode: mode, from: from, till: till)
+                self.enqueue(control, payload: command) { [weak self] write in
+                    guard let self else { return }
+                    switch write {
+                    case .failure(let error): self.isBusy = false; self.fail(error.localizedDescription)
+                    case .success:
+                        self.readSettings(control) { [weak self] read in
+                            guard let self else { return }; self.isBusy = false
+                            switch read {
+                            case .success(let updated):
+                                self.settings = updated
+                                if updated.matches(schedule: kind, mode: mode, from: from, till: till) { self.log(what, "Confirmed by the clock.") }
+                                else { self.fail("\(what): the write was accepted, but the clock did not return the requested schedule.") }
+                                self.readHandState()   // the DND state bit changes immediately
+                            case .failure(let error): self.settings = nil; self.fail("\(what) was sent, but verification failed: \(error.localizedDescription)")
+                            }
+                        }
+                    }
+                }
+            } catch { self.isBusy = false; self.fail(error is ProtocolError ? "This clock's \(name) schedule could not be read, so it was not changed." : error.localizedDescription) }
+        }
+    }
+    /// Read-only refresh of the state flags (used by the seconds pixel to keep DND/calibration fresh).
+    func readHandState() {
+        guard !demoMode, let stateCharacteristic, stateCharacteristic.properties.contains(.read) else { return }
+        enqueue(stateCharacteristic, payload: nil) { [weak self] result in
+            if case .success(let value) = result { self?.updateHandState(value) }
+        }
+    }
+    /// Reads the clock's active face (5075ffac, one byte); nil when unavailable or unreadable.
+    var canReadFace: Bool { sceneCharacteristic?.properties.contains(.read) ?? false }
+    func readFace(_ completion: @escaping (Int?) -> Void) {
+        guard let sceneCharacteristic, canReadFace else { completion(nil); return }
+        enqueue(sceneCharacteristic, payload: nil) { result in
+            if case .success(let value) = result, value.count == 1 { completion(Int(value[0])) } else { completion(nil) }
+        }
+    }
+    func announceDisplayCommand(_ quiet: TimeInterval) { onDisplayCommand.forEach { $0(quiet) } }
     func changeSettings(_ changes: [Int: UInt64], automaticRange: AutomaticBrightnessRange? = nil) {
         guard canControl else { return }
         if demoMode {
@@ -416,39 +483,44 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         }
     }
     func sendMessage(_ text: String, animation: Int, sound: Int, color: Int) {
-        do { send(try GlanceCommands.notice(text, animation: animation, sound: sound, color: color), title: "Message sent", detail: "\(text) · Bluetooth acknowledged; check the clock display.") }
+        do { let packet = try GlanceCommands.notice(text, animation: animation, sound: sound, color: color); announceDisplayCommand(90); send(packet, title: "Message sent", detail: "\(text) · Bluetooth acknowledged; check the clock display.") }
         catch { fail(error.localizedDescription) }
     }
     func startTimer(minutes: Int) {
         do {
             let packet = try GlanceCommands.timer(seconds: minutes * 60)
+            announceDisplayCommand(0)
             send(packet, title: "Timer sent", detail: "\(minutes) minutes · the countdown here is a Mac estimate.") { [weak self] in self?.timerEnd = Date().addingTimeInterval(Double(minutes * 60)) }
         } catch { fail(error.localizedDescription) }
     }
-    func stopTimer() { send(GlanceCommands.stopTimer, title: "Timer stop sent") { [weak self] in self?.timerEnd = nil } }
+    func stopTimer() { announceDisplayCommand(2); send(GlanceCommands.stopTimer, title: "Timer stop sent") { [weak self] in self?.timerEnd = nil } }
     func startCalibration() {
         guard !isCalibrating else { fail("Calibration is already moving the hands. Wait for the clock to stop."); return }
+        announceDisplayCommand(0)
         send(GlanceCommands.startCalibration, title: "Calibration started", detail: "Wait for the hands to finish moving. Confirm only when both hands point to 12.") { [weak self] in self?.needsCalibrationConfirmation = true }
     }
     func confirmCalibration() {
         guard !isCalibrating else { fail("Wait until the hands stop before confirming calibration."); return }
+        announceDisplayCommand(10)
         send(GlanceCommands.confirmCalibration, title: "Hand position confirmed") { [weak self] in self?.needsCalibrationConfirmation = false }
     }
     private func updateHandState(_ data: Data) {
         guard let state = try? ClockHandState(data: data) else { handStatus = "Clock hand-state format not recognised"; return }
+        handState = state; handStateUpdated = Date()
         isCalibrating = state.homing
         needsCalibrationConfirmation = state.awaitingConfirmation
         let next = state.motorFailure ? "Clock reports a motor failure" : state.homingFailure ? "Clock reports a homing failure" : state.homing ? "Clock is finding the hand reference…" : state.awaitingConfirmation ? "Clock is waiting for hand alignment confirmation" : "Clock reports no calibration in progress"
         if handStatus != next { log("Hand calibration state", next, error: state.motorFailure || state.homingFailure) }
         handStatus = next
     }
-    /// Background send (chime, weather, alarms): never shows an alert and never retries.
+    /// Background send (chime, weather, alarms, seconds): never shows an alert and never retries.
+    /// It does not mark the app busy, so frequent seconds scenes never grey out the controls; the
+    /// operation queue still runs every read and write one at a time.
     func sendQuietly(_ data: Data, title: String, logSuccess: Bool = true, completion: ((Bool) -> Void)? = nil) {
         if demoMode { if logSuccess { log("Demo · \(title.lowercased())", "No Bluetooth command was sent.") }; completion?(true); return }
-        guard isConnected, settings != nil, !isBusy, let control else { completion?(false); return }
-        isBusy = true
+        guard isConnected, settings != nil, let control else { completion?(false); return }
         enqueue(control, payload: data) { [weak self] result in
-            guard let self else { return }; self.isBusy = false
+            guard let self else { return }
             switch result {
             case .success: if logSuccess { self.log(title) }; completion?(true)
             case .failure(let error): self.log(title + " failed", error.localizedDescription, error: true); completion?(false)
@@ -456,10 +528,11 @@ final class BluetoothController: NSObject, ObservableObject, @preconcurrency CBC
         }
     }
     func testSound(_ sound: Int) {
+        announceDisplayCommand(90)
         do { send(try GlanceCommands.notice("Sound test", animation: 0, sound: sound, color: 12), title: "Sound test sent", detail: settings?.muted == true ? "Mute is on, so the clock may stay silent." : Glance.sounds[sound]) }
         catch { fail(error.localizedDescription) }
     }
-    func stopAlarm() { send(GlanceCommands.alarmStop, title: "Alarm stop sent") }
+    func stopAlarm() { announceDisplayCommand(2); send(GlanceCommands.alarmStop, title: "Alarm stop sent") }
     var calibrationBusy: Bool { isCalibrating || needsCalibrationConfirmation }
 
     private func send(_ data: Data, title: String, detail: String = "", success: (() -> Void)? = nil) {

@@ -94,7 +94,9 @@ public sealed class ChimeService
         var text = clock.Settings?.TwelveHour == true ? $"{(hour % 12 == 0 ? 12 : hour % 12)}{(hour < 12 ? "AM" : "PM")}" : $"{hour:00}:00";
         try
         {
-            clock.SendQuietly(GlanceCommands.Notice(text, 0, Sound, 12), $"Hourly chime {text}", completion: ok =>
+            var packet = GlanceCommands.Notice(text, 0, Sound, 12);
+            clock.AnnounceDisplayCommand(90);
+            clock.SendQuietly(packet, $"Hourly chime {text}", completion: ok =>
             {
                 if (!ok && clock.IsConnected) lastHour = previousHour;   // try again a few seconds later this minute
             });
@@ -121,6 +123,10 @@ public sealed class WeatherService
     int lastHour = -1;
     byte[]? lastCommand;
     public bool Demo { get; set; }
+    /// True while the seconds pixel owns the ring slot; weather waits (as on the bridge).
+    public Func<bool> RingTaken { get; set; } = () => false;
+    /// The seconds pixel released the slot: send the weather ring again.
+    public void RingReleased() { lastCommand = null; Showing = 0; Send(user: false); }
 
     public WeatherOptions Options => Store.State.Weather;
     public WeatherPlace? Place => Store.State.Place;
@@ -210,6 +216,7 @@ public sealed class WeatherService
 
     public void Send(bool user)
     {
+        if (RingTaken()) return;
         if (!clock.IsConnected || clock.Settings is null || clock.CalibrationBusy) return;
         if (clock.IsBusy) { retryPending = true; return; }
         var now = DateTimeOffset.Now;
@@ -266,4 +273,176 @@ public sealed class WeatherService
     }
 
     public void LoadDemo(HourlyForecast forecast) { Demo = true; Forecast = forecast; Fetched = DateTime.Now; Showing = 1; }
+}
+
+/// A single ticking pixel on the ring, drawn by the clock from ~10-second scenes (SecondsScene), while
+/// this app is open and connected. A port of the bridge's updateComet() (and the Mac app's
+/// SecondsService): same scenes, pauses, slot sharing with weather and error latching.
+public sealed class SecondsService
+{
+    public event Action? Changed;
+    readonly ClockController clock;
+    readonly AlarmStore alarms;
+    readonly ChimeService chime;
+    readonly WeatherService weather;
+    readonly DispatcherTimer timer;
+    bool ownsSlot, inFlight, wasTimer, releasing;
+    long nextStep = -1;
+    DateTime holdUntil = DateTime.MinValue, lastStateRead = DateTime.MinValue;
+
+    public bool On => Store.State.SecondsOn;
+    public int Color => Store.State.SecondsColor;
+    public int Rings => Store.State.SecondsRings;
+    public string Status { get; private set; } = "Off — weather ring available";
+    public bool Running { get; private set; }
+    public bool Failed { get; private set; }
+
+    public SecondsService(ClockController clock, AlarmStore alarms, ChimeService chime, WeatherService weather)
+    {
+        this.clock = clock; this.alarms = alarms; this.chime = chime; this.weather = weather;
+        if (!SecondsScene.ValidColor(Color)) Store.State.SecondsColor = 18;
+        if (!SecondsScene.ValidRings(Rings)) Store.State.SecondsRings = SecondsScene.OuterRing;
+        weather.RingTaken = () => On;
+        clock.OnDisplayCommand.Add(quiet => Suspend(quiet));
+        timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        timer.Tick += (_, _) => Tick();
+        timer.Start();
+    }
+
+    /// Saves the options. Like the bridge's /api/comet: pause first, clear any error, start again.
+    public void Apply(bool on, int color, int rings)
+    {
+        if (!SecondsScene.ValidColor(color) || !SecondsScene.ValidRings(rings)) return;
+        Suspend();
+        Store.State.SecondsOn = on; Store.State.SecondsColor = color; Store.State.SecondsRings = rings; Store.Save();
+        Failed = false; nextStep = -1;
+        var name = SecondsScene.Colours.FirstOrDefault(c => c.Id == color).Name ?? color.ToString();
+        clock.Log(on ? $"Seconds on, colour {name}, LEDs {rings}" : "Seconds off; restoring weather");
+        if (!on) weather.RingReleased();   // queued after the delete above
+        Changed?.Invoke();
+    }
+    public void Retry() => Apply(On, Color, Rings);
+
+    /// Removes the seconds scene before a disconnect or quit, so no stopped pixel is left on the ring.
+    public void Release(Action done)
+    {
+        releasing = true; nextStep = -1;
+        if (!ownsSlot || !clock.IsConnected || clock.DemoMode) { done(); return; }
+        bool finished = false;
+        void Finish() { if (!finished) { finished = true; done(); } }
+        clock.SendQuietly(GlanceCommands.DeleteScene(SecondsScene.Slot), "Remove seconds scene", logSuccess: false, completion: ok => { if (ok) ownsSlot = false; Finish(); });
+        DispatcherTimer.RunOnce(Finish, TimeSpan.FromSeconds(1.5));
+    }
+
+    void SetStatus(string text, bool running = false)
+    {
+        if (Status == text && Running == running) return;
+        Status = text; Running = running; Changed?.Invoke();
+    }
+    /// Removes our scene (if any) and optionally holds off for `hold` seconds.
+    public void Suspend(double hold = 0)
+    {
+        if (hold > 0 && DateTime.Now.AddSeconds(hold) > holdUntil) holdUntil = DateTime.Now.AddSeconds(hold);
+        nextStep = -1;
+        if (!ownsSlot || !clock.IsConnected || clock.DemoMode) return;
+        ownsSlot = false;
+        clock.SendQuietly(GlanceCommands.DeleteScene(SecondsScene.Slot), "Pause seconds", logSuccess: false, completion: ok =>
+        {
+            if (!ok && clock.IsConnected) { ownsSlot = true; LatchFailure("Pausing the seconds failed"); }
+        });
+    }
+    void LatchFailure(string why)
+    {
+        Failed = true;
+        SetStatus("Stopped after a Bluetooth error — press Retry");
+        clock.Log("Seconds stopped", why + ". Press Retry on the Display tab.", error: true);
+    }
+
+    static int FrameAt(DateTime utc)
+    {
+        long ticks = utc.Ticks;
+        return (int)(ticks / TimeSpan.TicksPerSecond % 60) * SecondsScene.Fps + Math.Min(49, (int)(ticks % TimeSpan.TicksPerSecond * SecondsScene.Fps / TimeSpan.TicksPerSecond));
+    }
+    static long StepAt(DateTime utc) => utc.Ticks / TimeSpan.TicksPerMinute * SecondsScene.Pixels + SecondsScene.PixelAt(FrameAt(utc));
+
+    async void Tick()
+    {
+        if (releasing) { if (!clock.IsConnected) releasing = false; return; }   // until the disconnect lands
+        if (inFlight) return;
+        if (!On)
+        {
+            if (ownsSlot) Suspend();
+            if (!Failed) SetStatus("Off — weather ring available");
+            return;
+        }
+        if (clock.DemoMode) { SetStatus("Demo · seconds preview only, nothing is sent"); return; }
+        if (Failed) { SetStatus("Stopped after a Bluetooth error — press Retry"); return; }
+        if (!clock.IsConnected || clock.Settings is null) { ownsSlot = false; nextStep = -1; SetStatus("Waiting for the clock"); return; }
+        var now = DateTime.Now;
+        // Read-only state checks: quicker while paused, slower while playing.
+        bool blockedState = clock.HandState is null || clock.CalibrationBusy || clock.DoNotDisturbActive;
+        if ((now - lastStateRead).TotalSeconds >= (blockedState ? 2 : 5)) { lastStateRead = now; clock.ReadHandState(); }
+        if (clock.HandStateUpdated is not DateTime updated || (now - updated).TotalSeconds > 12) { Suspend(); SetStatus("Paused — waiting for fresh clock status"); return; }
+        int day = ((int)now.DayOfWeek + 6) % 7;   // Monday = 0
+        bool alarmDue = alarms.Alarms.Any(a => a.Enabled && a.Hour == now.Hour && a.Minute == now.Minute && (a.Days == 0 || (a.Days & (1 << day)) != 0));
+        bool chimeDue = now.Minute == 0 && ((clock.Settings?.BuiltInChimeSound ?? 0) != 0 || (chime.On && !chime.IsQuiet(now.Hour)));
+        bool timerRunning = clock.TimerEnd is DateTime end && end > now;
+        if (wasTimer && !timerRunning && now.AddSeconds(15) > holdUntil) holdUntil = now.AddSeconds(15);   // timer-complete sound/animation
+        wasTimer = timerRunning;
+        bool hands = clock.CalibrationBusy, dnd = clock.DoNotDisturbActive;
+        if (hands || timerRunning || dnd || alarmDue || chimeDue || holdUntil > now)
+        {
+            Suspend();
+            SetStatus(hands ? "Paused for hand calibration" : timerRunning ? "Paused for the timer" : dnd ? "Paused — clock Do Not Disturb"
+                : alarmDue || chimeDue ? "Paused for an alarm or hourly chime" : "Paused for a message or timer finish");
+            return;
+        }
+        long step = StepAt(DateTime.UtcNow);
+        if (ownsSlot && nextStep >= 0 && step < nextStep && step > nextStep - 2 * SecondsScene.Pixels) return;   // the scene still draws by itself
+        if (!clock.CanReadFace) { Suspend(); SetStatus("Unavailable: clock display status cannot be read"); return; }
+        inFlight = true;
+        // Read the active face before each scene; an unknown face fails closed.
+        var face = await clock.ReadFace();
+        if (face is not int f)
+        {
+            inFlight = false;
+            if (clock.IsConnected) { Suspend(); LatchFailure("Could not read the active clock face"); }   // a dropped link just resets
+            return;
+        }
+        if (SecondsScene.AlertFace(f)) { inFlight = false; Suspend(5); SetStatus("Paused for the clock's alert display"); return; }
+        SendScene();
+    }
+
+    void SendScene()
+    {
+        var utc = DateTime.UtcNow;
+        int frame = FrameAt(utc); long step = StepAt(utc);
+        bool continuation = ownsSlot && step == nextStep, starting = !ownsSlot;
+        if (!On || Failed || SecondsScene.Scene(frame, Color, continuation, Rings) is not (byte[] data, int endPixel)) { inFlight = false; return; }
+        void Finish(bool ok)
+        {
+            inFlight = false;
+            if (!ok)
+            {
+                if (!clock.IsConnected) { ownsSlot = false; nextStep = -1; return; }   // link dropped: start fresh on reconnect
+                ownsSlot = true; LatchFailure("A seconds scene was not acknowledged"); return;   // it may have acted; Off/Retry cleans up
+            }
+            ownsSlot = true; nextStep = step + (endPixel - SecondsScene.PixelAt(frame));
+            SetStatus($"Playing · single pixel, new scene about every {(SecondsScene.SceneSteps[Rings] == 8 ? "10" : "7.5")} s", running: true);
+            if (starting) clock.Log("Seconds started", "Ring only, silent. Runs while this app is open.");
+        }
+        void Write() => clock.SendQuietly(data, "Seconds scene", logSuccess: false, completion: ok =>
+        {
+            // Start once (command 31, the reference's silent start; not 35, the cloud-fetch animation).
+            if (ok && starting) clock.SendQuietly(new byte[] { 31, 0, 0, 0 }, "Start seconds scene", logSuccess: false, completion: Finish);
+            else Finish(ok);
+        });
+        if (!starting) { Write(); return; }
+        // Weather forecasts are stored apart from custom scenes, so remove both weather slots first.
+        clock.SendQuietly(GlanceCommands.DeleteScene(2), "Remove old weather scene (slot 2)", logSuccess: false, completion: ok =>
+        {
+            if (!ok) { Finish(false); return; }
+            clock.SendQuietly(GlanceCommands.DeleteScene(1), "Remove old weather scene (slot 1)", logSuccess: false, completion: ok2 => { if (ok2) Write(); else Finish(false); });
+        });
+    }
 }

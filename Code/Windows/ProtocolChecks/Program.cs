@@ -23,6 +23,30 @@ byte[] Cat(params byte[][] p) => p.SelectMany(x => x).ToArray();
 byte[] Settings(ulong brightness = 128) => Cat(WireMessage.IntegerField(2, 0), WireMessage.IntegerField(4, 1), WireMessage.IntegerField(10, brightness));
 Dictionary<int, ulong> D(params (int, ulong)[] p) => p.ToDictionary(x => x.Item1, x => x.Item2);
 
+// Built-in hourly chime: patch only field 15; preserve field 18 and unknown bytes.
+{
+    var unknown = WireMessage.BytesField(30, new byte[] { 0, 255, 8 });
+    var original = new ClockSettings(Cat(Settings(0xab1edc00), WireMessage.IntegerField(15, 6),
+        WireMessage.IntegerField(18, unchecked((ulong)(long)-62)), unknown));
+    Equal(original.BuiltInChimeSound, 6UL, "saved Bells");
+    for (ulong sound = 0; sound <= 17; sound++) {
+        var updated = new ClockSettings(original.Patched(D((15, sound)))[4..]);
+        Equal(updated.BuiltInChimeSound, sound, "chime roundtrip");
+        Equal(updated.TimeOffsetMinutes, -62, "time offset kept");
+        Equal(new WireMessage(updated.Raw).Integer(10), (ulong?)0xab1edc00, "brightness kept");
+        Same(updated.Raw[^unknown.Length..], unknown, "unknown bytes kept");
+        Check(updated.Matches(D((15, sound))), "chime verification");
+        Check(!updated.Matches(D((15, (sound + 1) % 18))), "wrong chime rejected");
+    }
+    Throws(() => original.Patched(D((15, 18))), "invalid sound 18");
+    Throws(() => original.Patched(D((15, ulong.MaxValue))), "invalid maximum sound");
+    Equal(new ClockSettings(Settings()).BuiltInChimeSound, 0UL, "absent proto default Off");
+    var future = new ClockSettings(Cat(Settings(), WireMessage.IntegerField(15, 99)));
+    Equal(future.BuiltInChimeSound, 99UL, "unknown sound retained");
+    Equal(new ClockSettings(future.Patched(D((2, 1)))[4..]).BuiltInChimeSound, 99UL, "unrelated edit keeps unknown sound");
+    Throws(() => new ClockSettings(Cat(Settings(), WireMessage.BytesField(15, new byte[] { 6 }))), "malformed chime field");
+}
+
 // 1. Discovery filtering
 Equal(ClockDiscovery.IsGlance(null, Array.Empty<string>()), false, "no name");
 Equal(ClockDiscovery.IsGlance("", new[] { "180F" }), false, "battery only");
@@ -188,6 +212,75 @@ foreach (var bytes in new[] { new byte[] { 8, 128 }, new byte[] { 18, 5, 1 }, ne
     Equal(ClockTimeCorrection.Describe(2882), "forward 2 days 2 minutes", "describe forward");
 }
 
+// 14. Seconds scenes (bridge 1.20/1.21): byte-identical to the ESP32 C++ golden vectors.
+string Hex(byte[] d) => Convert.ToHexString(d).ToLowerInvariant();
+ulong Fnv(ulong h, byte[] d) { foreach (var x in d) { h ^= x; h *= 1099511628211UL; } h ^= 0xff; h *= 1099511628211UL; return h; }
+{
+    var a = SecondsScene.Scene(0, 18, false, 1)!.Value;
+    Equal(Hex(a.Data), "000008010a0a0802180132040880de030a0c08021801320608808048082f0a0e0802103f180132060881804808000a0e0802107d180132060882804808010a0f080210bc01180132060883804808020a0f080210fa01180132060884804808030a0f080210b902180132060885804808040a0f080210f702180132060886804808050a0f080210b60318013206088780480806", "takeover scene");
+    Equal(a.EndPixel, 8, "takeover end");
+    var b = SecondsScene.Scene(1234, 5, true, 9)!.Value;
+    Equal(Hex(b.Data), "000008010a1308021801320d0893801408d38114081208d2010a15080210101801320d0894801408d48114081308d3010a150802104f1801320d0895801408d58114081408d4010a160802108d011801320d0896801408d68114081508d5010a16080210cc011801320d0897801408d78114081608d6010a160802108a021801320d0898801408d88114081708d701", "gapped continuation");
+    Equal(b.EndPixel, 25, "gapped end");
+    var c = SecondsScene.Scene(2990, 24, false, 15)!.Value;
+    Equal(Hex(c.Data), "000008010a0a0802180132040880de030a0e08021801320808af806308ae80030a100802100a180132080880806308af80030a10080210491801320808818063088080030a1108021087011801320808828063088180030a11080210c6011801320808838063088280030a1108021084021801320808848063088380030a11080210c302180132080885806308848003", "all LEDs across the minute");
+    Equal(c.EndPixel, 54, "wrap end");
+    ulong h = 1469598103934665603UL;
+    foreach (var cont in new[] { false, true }) for (int rings = 1; rings <= 15; rings++) foreach (var color in new[] { 1, 17, 24 })
+    {
+        int minimum = 99;
+        for (int f = 0; f < 3000; f++)
+        {
+            var sc = SecondsScene.Scene(f, color, cont, rings)!.Value;
+            Check(sc.Data.Length <= 155 && sc.Data[..4].SequenceEqual(new byte[] { 0, 0, 8, 1 }), "bounded ring-only scene");
+            if (cont) minimum = Math.Min(minimum, sc.EndPixel - SecondsScene.PixelAt(f));
+            h = Fnv(h, sc.Data); h = Fnv(h, new[] { (byte)sc.EndPixel });
+        }
+        if (cont) Equal(minimum, SecondsScene.SceneSteps[rings], $"steps table mask {rings}");
+    }
+    Equal(h.ToString("x16"), "4a35df0c4ed39f83", "all scenes match the bridge");
+    Check(SecondsScene.Scene(3000, 18) is null && SecondsScene.Scene(0, 0) is null && SecondsScene.Scene(0, 18, false, 0) is null && SecondsScene.Scene(0, 18, false, 16) is null, "invalid scene inputs");
+    Check(SecondsScene.AlertFace(2) && SecondsScene.AlertFace(9) && !SecondsScene.AlertFace(9 | 128) && !SecondsScene.AlertFace(1), "alert faces");
+    Equal(SecondsScene.Colours.Length, 24, "palette size"); Equal(SecondsScene.Colours[17].Name, "Turquoise", "default colour");
+    var state = new ClockHandState(new byte[] { 0x10, 0x62 });
+    Check(state.DoNotDisturb && !state.TimeAdjusting && !state.Homing && state.Bits == 0x6210, "DND state bits");
+    Check(new ClockHandState(new byte[] { 0x14, 0x63 }).TimeAdjusting, "time-adjust bit");
+}
+// 15. Night schedules (bridge 1.22): DND field 1 + 3, Silent field 14 + 4.
+{
+    var baseBytes = Cat(WireMessage.IntegerField(2, 0), WireMessage.IntegerField(4, 1), WireMessage.IntegerField(10, 128),
+        WireMessage.BytesField(1, Cat(WireMessage.IntegerField(1, 1), WireMessage.IntegerField(2, 22), WireMessage.IntegerField(3, 8))),
+        WireMessage.IntegerField(15, 6), WireMessage.IntegerField(18, unchecked((ulong)(long)-90)), WireMessage.BytesField(30, new byte[] { 7, 7 }));
+    Equal(Hex(baseBytes), "100020015080010a0608011016180878069001a6ffffffffffffffff01f201020707", "fixture");
+    var s = new ClockSettings(baseBytes);
+    Equal(s.DoNotDisturb, new ClockSchedule(true, 1, 22, 8), "DND read");
+    Equal(s.Silent.Mode, 2, "permanentMute = Silent Always");
+    Equal(Hex(s.PatchedSchedule(ScheduleKind.DoNotDisturb, 0, 22, 8)), "05000000100020015080010a0608001016180878069001a6ffffffffffffffff01f2010207071800", "DND off");
+    Equal(Hex(s.PatchedSchedule(ScheduleKind.Silent, 1, 22, 7)), "05000000100020005080010a0608011016180878069001a6ffffffffffffffff01f2010207077206080110161807", "Silent 22–07");
+    Equal(Hex(s.PatchedSchedule(ScheduleKind.DoNotDisturb, 2, 21, 6)), "05000000100020015080010a0608001015180678069001a6ffffffffffffffff01f2010207071801", "DND always");
+    ulong h = 1469598103934665603UL; int accepted = 0;
+    foreach (var kind in new[] { ScheduleKind.DoNotDisturb, ScheduleKind.Silent }) for (int mode = 0; mode <= 2; mode++)
+    for (int f = 0; f < 24; f++) for (int t = 0; t < 24; t++)
+    {
+        if (!ClockSchedule.IsValid(mode, f, t)) { int m = mode, ff = f, tt = t; Throws(() => s.PatchedSchedule(kind, m, ff, tt), "invalid schedule"); continue; }
+        var cmd = s.PatchedSchedule(kind, mode, f, t);
+        h = Fnv(h, cmd); accepted++;
+        var u = new ClockSettings(cmd[4..]);
+        Check(u.MatchesSchedule(kind, mode, f, t), "read-back matches");
+        var other = kind == ScheduleKind.DoNotDisturb ? ScheduleKind.Silent : ScheduleKind.DoNotDisturb;
+        Equal(u.Schedule(other), s.Schedule(other), "other schedule untouched");
+        Check(u.TimeOffsetMinutes == -90 && u.BuiltInChimeSound == 6 && u.Brightness == 128, "other settings kept");
+        if (kind == ScheduleKind.Silent) Equal(u.Muted, mode == 2, "Silent Always = Mute");
+    }
+    Equal(accepted, 2 * 3 * 576 - 2 * 24, "only Scheduled with equal hours refused");
+    Equal(h.ToString("x16"), "acc77cd884c5f1f3", "all night patches match the bridge");
+    Equal(new ClockSettings(Settings()).DoNotDisturb, new ClockSchedule(true, 0, 22, 8), "absent = off 22–08");
+    var bad = new ClockSettings(Cat(Settings(), WireMessage.IntegerField(1, 5)));
+    Check(!bad.DoNotDisturb.Known, "malformed DND unreadable");
+    Throws(() => bad.PatchedSchedule(ScheduleKind.DoNotDisturb, 1, 22, 8), "malformed DND not editable");
+    Check(!new ClockSettings(Cat(Settings(), WireMessage.BytesField(14, WireMessage.IntegerField(2, 30)))).Silent.Known, "hour 30 unreadable");
+}
+
 if (failures > 0) { Console.WriteLine($"FAILED: {failures} check(s)"); return 1; }
-Console.WriteLine("PASS: 12 check groups (discovery filtering, settings preservation, validation, automatic brightness range, notices, timers, malformed packets, hand-state decoding, alarms, weather scenes, clock time offset, typed/manual time and estimate).");
+Console.WriteLine("PASS: 15 check groups (discovery filtering, settings preservation, validation, automatic brightness range, notices, timers, malformed packets, hand-state decoding, alarms, weather scenes, clock time offset, typed/manual time and estimate, built-in hourly chime, seconds scenes, night schedules).");
 return 0;
