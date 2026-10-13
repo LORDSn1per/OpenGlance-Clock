@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>OpenGlance Clock</string>
+<key>CFBundleDisplayName</key><string>OpenGlance Clock</string>
+<key>CFBundleIdentifier</key><string>org.openglance.clock</string>
+<key>CFBundleExecutable</key><string>OpenGlanceClock</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.22</string>
+<key>CFBundleVersion</key><string>22</string>
+<key>CFBundleIconFile</key><string>OpenGlanceClock</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSBluetoothAlwaysUsageDescription</key><string>OpenGlance Clock uses Bluetooth to find and control your Glance Clock locally, without a cloud account.</string>
+</dict></plist>

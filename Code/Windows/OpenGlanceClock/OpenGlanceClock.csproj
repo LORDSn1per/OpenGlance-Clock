@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Windows release: net8.0-windows10.0.19041.0 (WinRT Bluetooth). net8.0 builds the same UI
+       without Bluetooth so the screens can be rendered and checked on a Mac (demo mode only). -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFrameworks>net8.0;net8.0-windows10.0.19041.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>OpenGlanceClock</AssemblyName>
+    <RootNamespace>OpenGlance</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ApplicationIcon>Assets/OpenGlance.ico</ApplicationIcon>
+    <Product>OpenGlance Clock</Product>
+    <Version>0.0.0</Version>
+    <InformationalVersion>dev</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+  </PropertyGroup>
+  <PropertyGroup Condition="$(TargetFramework.Contains('windows'))">
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <AvaloniaResource Include="Assets/Logo.png" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <ProjectReference Include="../GlanceProtocol/GlanceProtocol.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,13 @@
+# Built releases live in GitHub Releases, not in the repository
+/MAC/
+/Windows/
+/Firmware/
+*.app
+*.exe
+*.bin
+!Code/OpenGlanceFlasher/Support/*.bin
+# Build output
+.build/
+bin/
+obj/
+.DS_Store

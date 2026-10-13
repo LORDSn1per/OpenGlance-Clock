@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Windows release: win-x64 single file with Espressif's esptool.exe embedded (unmodified, GPLv2).
+       Pass -p:EsptoolDir=<folder with esptool.exe and LICENSE>; build.sh downloads and checksums it.
+       Without it the app still builds (screenshot checks on a Mac) but cannot flash. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>OpenGlanceFlasher</AssemblyName>
+    <RootNamespace>OpenGlanceFlasher</RootNamespace>
+    <ApplicationIcon>Assets/OpenGlance.ico</ApplicationIcon>
+    <Product>OpenGlance Flasher</Product>
+    <Version>0.0.0</Version>
+    <InformationalVersion>dev</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <SupportDir>$(MSBuildThisFileDirectory)../../OpenGlanceFlasher/Support</SupportDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <AvaloniaResource Include="Assets/Logo.png" />
+    <EmbeddedResource Include="$(SupportDir)/bootloader.bin" LogicalName="Support/bootloader.bin" />
+    <EmbeddedResource Include="$(SupportDir)/partitions.bin" LogicalName="Support/partitions.bin" />
+    <EmbeddedResource Include="$(SupportDir)/boot_app0.bin" LogicalName="Support/boot_app0.bin" />
+    <EmbeddedResource Condition="'$(EsptoolDir)' != ''" Include="$(EsptoolDir)/esptool.exe" LogicalName="Tools/esptool.exe" />
+    <EmbeddedResource Condition="'$(EsptoolDir)' != ''" Include="$(EsptoolDir)/LICENSE" LogicalName="Tools/esptool-LICENSE.txt" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <ProjectReference Include="../FlasherCore/FlasherCore.csproj" />
+  </ItemGroup>
+</Project>
