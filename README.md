@@ -214,4 +214,16 @@ Settings are always read from the clock first, unknown fields are preserved, and
 
 ---
 
+## Licence
+
+OpenGlance is released under the [MIT License](LICENSE).
+
+Third-party parts keep their own licences:
+- The ESP32-C3 bootloader, partition table and boot selector images in `Code/OpenGlanceFlasher/Support/` come from Espressif's Arduino core (Apache-2.0).
+- The Flasher releases include Espressif's unmodified esptool (GPLv2, [source](https://github.com/espressif/esptool)).
+- The apps and firmware use Avalonia (MIT), NimBLE-Arduino (Apache-2.0) and the Espressif Arduino core (LGPL-2.1).
+- Weather data is from [Open-Meteo](https://open-meteo.com) (CC BY 4.0).
+
+---
+
 *OpenGlance is an independent hobby project, not affiliated with or endorsed by Glance. Opening and modifying your clock is at your own risk.*
